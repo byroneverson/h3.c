@@ -1534,6 +1534,8 @@ static inline int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
             output, cache.outputShape, mps_dtype, 0);
         NSDictionary *results = @{cache.output: outputData};
         @try {
+            // Disabling extra optimization fixes the macos 27 "Failed to import MPS module" error for now
+            MPSGraphCompilationDescriptor *compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
             compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
             MPSGraphExecutionDescriptor *executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
             executionDescriptor.compilationDescriptor = compilationDescriptor;
