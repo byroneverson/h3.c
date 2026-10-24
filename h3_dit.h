@@ -4,6 +4,7 @@
 #include "h3_gpu.h"
 #include "h3_host.h"
 #include "h3_text_encoder.h"
+#include "h3_lup.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -22,8 +23,8 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
  * small block norms and two alternating BF16 matrix slots. */
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const char *shader_source_path,
-                         const h3_text_embedding *text,
-                         const h3_layout *layout,
+                         h3_text_embedding *text,
+                         h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
@@ -42,6 +43,10 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
                          int use_f16_dit,
+                         int lup_enabled,
+                         float lup_scale,
+                         uint32_t lup_steps,
+                         h3_layout *lup_layout,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 
@@ -51,8 +56,8 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
                          const char *shader_source_path,
-                         const h3_text_embedding *text,
-                         const h3_layout *layout,
+                         h3_text_embedding *text,
+                         h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
@@ -71,6 +76,10 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
                          int use_f16_dit,
+                         int lup_enabled,
+                         float lup_scale,
+                         uint32_t lup_steps,
+                         h3_layout *lup_layout,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -105,7 +114,7 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
                    char *error, size_t error_size);
 
 /* Current serving sampler: independent video/audio shifted Euler grids. */
-int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
+int h3_dit_denoise_euler(h3_dit *dit, float **video_latent,
                          float *audio_latent, int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
@@ -122,7 +131,7 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
  * trajectory (video_latent/audio_latent on return) is unaffected — this only
  * changes what gets shown to the preview callback. */
 int h3_dit_denoise_euler_preview(
-                         h3_dit *dit, float *video_latent,
+                         h3_dit *dit, float **video_latent,
                          float *audio_latent, int reuse_interval,
                          int preview_mode,
                          h3_dit_progress progress, void *progress_opaque,

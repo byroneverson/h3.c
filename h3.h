@@ -135,6 +135,9 @@ typedef struct {
     int text_enc_size;
     const char *text_enc_adapter;
     int use_f16_dit;
+    int lup_enabled;
+    float lup_scale;
+    uint32_t lup_steps;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
@@ -157,6 +160,7 @@ enum {
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, H3_PREVIEW_RAW, \
     H3_TEXT_ENC_32B, NULL, \
     0, \
+    0, 2.0, 2, \
     NULL, NULL, NULL \
 }
 

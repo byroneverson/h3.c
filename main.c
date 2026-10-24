@@ -3,6 +3,7 @@
 #include "h3_host.h"
 #include "h3_terminal.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -66,10 +67,24 @@ static void usage(const char *program) {
         "      --use-text-encoder S  Text encoder size: 32b (default), 8b, or 4b\n"
         "      --use-text-encoder-adapter PATH  Path of text encoder adapter directory\n"
         "      --use-f16-dit      Use f16 for dit blocks (Amduraznak's fix modified for M1)\n"
+        "      --lup-enabled      Enable latent upscaler (LBH-123-AI's latent upscaler)\n"
+        "      --lup-scale S      Latent upscaler scale (default: 2.0)\n"
+        "      --lup-steps S      Latent upscaler hi-res steps (default: 4)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
         program, program, program);
+}
+
+static float parse_float(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    float parsed = strtof(value, &end);
+    if (errno || !end || *end) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    return parsed;
 }
 
 static int parse_int(const char *value, const char *label) {
@@ -101,9 +116,36 @@ static int frames_from_seconds(const char *value) {
     return (int)rounded;
 }
 
+static uint32_t parse_u32(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    const char *ptr = value;
+    while (isspace((unsigned char)*ptr)) {
+        ptr++;
+    }
+    if (*ptr == '-') {
+        fprintf(stderr, "h3: invalid %s (negative value not allowed): %s\n", label, value);
+        exit(2);
+    }
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno || !end || *end) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    return (uint32_t)parsed;
+}
+
 static uint64_t parse_u64(const char *value, const char *label) {
     char *end = NULL;
     errno = 0;
+    const char *ptr = value;
+    while (isspace((unsigned char)*ptr)) {
+        ptr++;
+    }
+    if (*ptr == '-') {
+        fprintf(stderr, "h3: invalid %s (negative value not allowed): %s\n", label, value);
+        exit(2);
+    }
     unsigned long long parsed = strtoull(value, &end, 10);
     if (errno || !end || *end) {
         fprintf(stderr, "h3: invalid %s: %s\n", label, value);
@@ -264,6 +306,9 @@ int main(int argc, char **argv) {
            OPT_TEXT_ENC_SIZE,
            OPT_TEXT_ENC_ADAPTER,
            OPT_USE_F16_DIT,
+           OPT_LUP_ENABLED,
+           OPT_LUP_SCALE,
+           OPT_LUP_STEPS,
            OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
@@ -320,6 +365,9 @@ int main(int argc, char **argv) {
         {"use-text-encoder", required_argument, NULL, OPT_TEXT_ENC_SIZE},
         {"use-text-encoder-adapter", required_argument, NULL, OPT_TEXT_ENC_ADAPTER},
         {"use-f16-dit", no_argument, NULL, OPT_USE_F16_DIT},
+        {"lup-enabled", no_argument, NULL, OPT_LUP_ENABLED},
+        {"lup-scale", required_argument, NULL, OPT_LUP_SCALE},
+        {"lup-steps", required_argument, NULL, OPT_LUP_STEPS},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
         {"help", no_argument, NULL, 'h'},
@@ -506,6 +554,15 @@ int main(int argc, char **argv) {
             case OPT_TEXT_ENC_ADAPTER: params.text_enc_adapter = optarg; break;
             case OPT_USE_F16_DIT:
                 params.use_f16_dit = 1;
+                break;
+            case OPT_LUP_ENABLED:
+                params.lup_enabled = 1;
+                break;
+            case OPT_LUP_SCALE:
+                params.lup_scale = parse_float(optarg, "latent upscaler scale");
+                break;
+            case OPT_LUP_STEPS:
+                params.lup_steps = parse_u32(optarg, "latent upscaler steps");
                 break;
             case OPT_PROFILE: profile = 1; break;
             case OPT_INFO: info = 1; break;

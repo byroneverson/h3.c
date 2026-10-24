@@ -11,6 +11,7 @@
 #include "h3_video_encoder.h"
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
+#include "h3_lup.h"
 
 #include <errno.h>
 #include <math.h>
@@ -961,7 +962,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                                params->width;
     int render_height = params->render_height ? params->render_height :
                                                  params->height;
-    if (h3_align_frame_count(params->frames) < 22) {
+    int final_width = params->width;
+    int final_height = params->height;
     // Allow short video output for debugging
     if (h3_align_frame_count(params->frames) < 5) { //22) {
         h3_set_error(ctx,
@@ -1558,6 +1560,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (progress.cancelled) goto cleanup;
 
+    h3_layout lup_layout;
+    int lup_latent_h, lup_latent_w;
+    if (params->lup_enabled) {
+        memset(&lup_layout, 0, sizeof(lup_layout));
+        lup_latent_h = h3_lup_scale_latent(latent_h, params->lup_scale);
+        lup_latent_w = h3_lup_scale_latent(latent_w, params->lup_scale);
+        h3_layout_spec lup_spec = {(int)text.tokens, temporal.video_t, lup_latent_h,
+                               lup_latent_w, temporal.audio_t, temporal.frame_count,
+                               keyframes, keyframe_count,
+                               layout_references,
+                               ref2va ? params->reference_count : 0};
+        if (!h3_layout_build(&lup_spec, &lup_layout, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+    }
+
     h3_layout_spec spec = {(int)text.tokens, temporal.video_t, latent_h,
                            latent_w, temporal.audio_t, temporal.frame_count,
                            keyframes, keyframe_count,
@@ -1568,7 +1587,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(params->steps, &sigmas)) {
+    if (!h3_serving_schedule_build(params->steps, 1.0f, &sigmas)) {
         h3_set_error(ctx, "cannot construct the requested sigma schedule");
         goto cleanup;
     }
@@ -1605,6 +1624,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
             params->use_f16_dit,
+            params->lup_enabled,
+            params->lup_scale,
+            params->lup_steps,
+            &lup_layout,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
@@ -1627,6 +1650,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
             params->use_f16_dit,
+            params->lup_enabled,
+            params->lup_scale,
+            params->lup_steps,
+            &lup_layout,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {
@@ -1644,6 +1671,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             fprintf(stderr, "h3: prepared DiT cache miss; model retained\n");
         }
     }
+    if (!params->lup_enabled) h3_text_embedding_free(&text);
     free(condition_video_rows);
     condition_video_rows = NULL;
     free(condition_audio_rows);
@@ -1689,11 +1717,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         range_preview.latent_h = latent_h;
         range_preview.latent_w = latent_w;
         range_preview.output_frames = temporal.frame_count;
-        range_preview.output_width = params->width;
-        range_preview.output_height = params->height;
+        range_preview.output_width = final_width;
+        range_preview.output_height = final_height;
         range_preview.frame_count = params->preview_frame_count;
         denoise_ok = h3_dit_denoise_euler_preview(
-            dit, video, audio, params->denoise_reuse, params->preview_mode,
+            dit, &video, audio, params->denoise_reuse, params->preview_mode,
             h3_dit_progress_bridge, &progress,
             h3_deliver_denoise_preview_range, &range_preview,
             detail, sizeof(detail));
@@ -1708,11 +1736,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             live_preview.latent_h = latent_h;
             live_preview.latent_w = latent_w;
             live_preview.output_frames = temporal.frame_count;
-            live_preview.output_width = params->width;
-            live_preview.output_height = params->height;
+            live_preview.output_width = final_width;
+            live_preview.output_height = final_height;
         }
         denoise_ok = h3_dit_denoise_euler_preview(
-            dit, video, audio, params->denoise_reuse, params->preview_mode,
+            dit, &video, audio, params->denoise_reuse, params->preview_mode,
             h3_dit_progress_bridge, &progress,
             preview_decoder ? h3_deliver_denoise_preview : NULL,
             preview_decoder ? &live_preview : NULL,
@@ -1731,6 +1759,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
+
+    if (params->lup_enabled) {
+        latent_h = lup_latent_h;
+        latent_w = lup_latent_w;
+        final_height = lup_latent_h * H3_VAE_SPATIAL_RATIO;
+        final_width = lup_latent_w * H3_VAE_SPATIAL_RATIO;
+    }
+
     if (progress.cancelled) goto cleanup;
     h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
@@ -1780,18 +1816,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     int output_width = frames.width;
     int output_height = frames.height;
-    if (output_width != params->width || output_height != params->height) {
+    if (output_width != final_width || output_height != final_height) {
         uint8_t *resized = NULL;
         if (!h3_resize_rgb24_high_quality(
                 rgb8, frames.frames, output_width, output_height,
-                params->width, params->height, &resized)) {
+                final_width, final_height, &resized)) {
             h3_set_error(ctx, "cannot resize generated RGB frames");
             goto cleanup;
         }
         free(rgb8);
         rgb8 = resized;
-        output_width = params->width;
-        output_height = params->height;
+        output_width = final_width;
+        output_height = final_height;
     }
     if (params->on_frame) {
         size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
@@ -1829,7 +1865,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->fps = H3_FPS;
     result->sample_rate = waveform.sample_rate;
     result->seed = params->seed;
-
 cleanup:
     free(conditioning_key);
     free(prepared_key);
@@ -1864,6 +1899,7 @@ cleanup:
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);
+
     return result;
 }
 

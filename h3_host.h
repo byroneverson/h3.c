@@ -113,7 +113,7 @@ double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);
 double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
 /* Released linear base grid: evaluations model forwards plus terminal zero. */
-int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
+int h3_serving_schedule_build(int evaluations, float denoise, h3_sigma_schedule *schedule);
 
 int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
                     char *error, size_t error_size);

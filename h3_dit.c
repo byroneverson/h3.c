@@ -1,6 +1,8 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_host.h"
+#include "h3_lup.h"
 #include "h3_safetensors.h"
 #include "h3_text_encoder.h"
 #include "h3_weights.h"
@@ -75,7 +77,6 @@ struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
-    // DEBUG LUP
     h3_lup *lup;
     int fused_mlp;
     int nax_mlp;
@@ -682,7 +683,9 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
     } else {
         LOAD1_BF16(q_norm, "attn.q_norm.weight", HEAD_DIM);
         LOAD1_BF16(k_norm, "attn.k_norm.weight", HEAD_DIM);
-#undef LOAD1
+    }
+#undef LOAD1_BF16
+#undef LOAD1_F16
     return 1;
 }
 
@@ -1874,10 +1877,87 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
+static char *h3_path(const char *root, const char *relative) {
+    size_t size = strlen(root) + strlen(relative) + 2;
+    char *result = malloc(size);
+    if (result) snprintf(result, size, "%s/%s", root, relative);
+    return result;
+}
+
+typedef struct {
+    h3_dit_progress callback;
+    void *opaque;
+} lup_progress;
+
+static void lup_load_report(int completed, int total, void *opaque) {
+    lup_progress *state = opaque;
+    report(state->callback, state->opaque, "load latent upscaler", completed, total);
+}
+
+static void lup_run_report(int completed, int total, void *opaque) {
+    lup_progress *state = opaque;
+    report(state->callback, state->opaque, "latent upscaler", completed, total);
+}
+
+static void lup_free_dit(h3_dit *dit) {
+    // Free old tensors
+    free_rope(dit);
+    free_maps(dit);
+    free_projection_maps(dit);
+    free_token_reduction_maps(dit);
+    free_previous_velocities(dit);
+    free_activations(dit);
+}
+
+static int lup_update_dit(h3_dit *dit,
+                          h3_dit_progress progress, void *progress_opaque,
+                          char *error, size_t error_size) {
+    h3_lup_ctx *ctx = h3_lup_get_ctx(dit->lup);
+    float lup_denoise = 0.3f;
+    // Free old layout
+    //h3_layout_free(&dit->layout);
+    // Replace layout
+    int token_reduction = dit->token_reduction;
+    if (!copy_layout(dit, ctx->layout, error, error_size) ||
+        !validate_layout(dit, ctx->text, error, error_size) ||
+        !configure_token_reduction(dit, token_reduction, error, error_size)) {
+        fail(error, error_size, "lup_update_dit replace failed");
+        return 0;
+    }
+    // Hi-res pass sigmas
+    h3_sigma_schedule sigmas;
+    if (!h3_serving_schedule_build(ctx->steps, lup_denoise, &sigmas)) {
+        fail(error, error_size, "lup_update_dit h3_serving_schedule_build failed");
+        return 0;
+    }
+    // Re-precompute schedule
+    schedule_progress schedule_state = {progress, progress_opaque};
+    dit->schedule = h3_dit_schedule_precompute(
+        dit->weights, dit->gpu, &sigmas, dit->video_condition_rows != 0,
+        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
+        error, error_size);
+    if (dit->schedule) {
+        configure_gate_ranked_blocks(dit);
+        h3_dit_schedule_prune(dit->schedule, dit->block_active,
+                              H3_DIT_BLOCKS);
+    }
+    // Reload tensors
+    if (!dit->schedule ||
+        !prepare_rope(dit, error, error_size) ||
+        !prepare_maps(dit, ctx->text, error, error_size) ||
+        !prepare_projection_maps(dit, error, error_size) ||
+        !prepare_token_reduction_maps(dit, error, error_size) ||
+        !allocate_activations(dit, error, error_size)) {
+        fail(error, error_size, "lup_update_dit prepare failed");
+        return 0;
+    }
+    return 1;
+}
+
 static h3_dit *load_dit(const char *weight_directory,
                         const char *shader_source_path,
-                        const h3_text_embedding *text,
-                        const h3_layout *layout,
+                        h3_text_embedding *text,
+                        h3_layout *layout,
                         const h3_sigma_schedule *sigmas,
                         unsigned active_blocks,
                         unsigned core_reuse_interval,
@@ -1896,6 +1976,10 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_grouped_quantizer,
                         int use_int8_row_fc2,
                         int use_f16_dit,
+                        int lup_enabled,
+                        float lup_scale,
+                        uint32_t lup_steps,
+                        h3_layout *lup_layout,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -2002,6 +2086,19 @@ static h3_dit *load_dit(const char *weight_directory,
         !prepare_token_reduction_maps(dit, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
         !allocate_activations(dit, error, error_size)) goto failed;
+
+    dit->lup = NULL;
+    if (lup_enabled) {
+        char *lup_weight_dir = h3_path(weight_directory, "../latent_upscaler");
+        lup_progress lup_state = {progress, progress_opaque};
+        dit->lup = h3_lup_load(dit->gpu, lup_weight_dir,
+                                lup_scale, lup_steps,
+                                lup_layout, text,
+                                lup_load_report, &lup_state,
+                                error, error_size);
+        if (!dit->lup) goto failed;
+    }
+
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
              dit->video_input, 0, condition_video_rows,
              wanted_video_condition)) ||
@@ -2020,8 +2117,8 @@ failed:
 
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const char *shader_source_path,
-                         const h3_text_embedding *text,
-                         const h3_layout *layout,
+                         h3_text_embedding *text,
+                         h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
@@ -2040,6 +2137,10 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
                          int use_f16_dit,
+                         int lup_enabled,
+                         float lup_scale,
+                         uint32_t lup_steps,
+                         h3_layout *lup_layout,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
@@ -2057,6 +2158,10 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_grouped_quantizer,
                     use_int8_row_fc2,
                     use_f16_dit,
+                    lup_enabled,
+                    lup_scale,
+                    lup_steps,
+                    lup_layout,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -2064,8 +2169,8 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
                          const char *shader_source_path,
-                         const h3_text_embedding *text,
-                         const h3_layout *layout,
+                         h3_text_embedding *text,
+                         h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
@@ -2084,6 +2189,10 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
                          int use_f16_dit,
+                         int lup_enabled,
+                         float lup_scale,
+                         uint32_t lup_steps,
+                         h3_layout *lup_layout,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -2105,6 +2214,10 @@ h3_dit *h3_dit_load_conditioned(
                     use_slower_grouped_quantizer,
                     use_int8_row_fc2,
                     use_f16_dit,
+                    lup_enabled,
+                    lup_scale,
+                    lup_steps,
+                    lup_layout,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -3222,21 +3335,21 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
 }
 
 int h3_dit_denoise_euler_preview(
-                         h3_dit *dit, float *video_latent,
+                         h3_dit *dit, float **video_latent,
                          float *audio_latent, int reuse_interval,
                          int preview_mode,
                          h3_dit_progress progress, void *progress_opaque,
                          h3_dit_preview preview, void *preview_opaque,
                          char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
-    if (!dit || !video_latent || !audio_latent || reuse_interval < 1 ||
+    if (!dit || !*video_latent || !audio_latent || reuse_interval < 1 ||
         reuse_interval > 32 ||
         dit->sigmas.steps != h3_dit_schedule_steps(dit->schedule)) {
         fail(error, error_size, "invalid Euler denoising arguments");
         return 0;
     }
     if (gpu_sampler_requested(dit))
-        return denoise_euler_gpu(dit, video_latent, audio_latent,
+        return denoise_euler_gpu(dit, *video_latent, audio_latent,
                                  reuse_interval, preview_mode,
                                  progress, progress_opaque,
                                  preview, preview_opaque,
@@ -3277,14 +3390,75 @@ int h3_dit_denoise_euler_preview(
         free(previous_video); free(previous_audio);
         return 0;
     }
+
+    int steps = dit->sigmas.steps;
+    if (dit->lup) {
+        h3_lup_ctx *ctx = h3_lup_get_ctx(dit->lup);
+        steps += ctx->steps;
+    }
+
     int ok = 1;
     int last_evaluated = -1;
     int previous_evaluated = -1;
-    for (int step = 0; step < dit->sigmas.steps && ok; step++) {
-        report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
+    for (int step_i = 0, step = 0; step_i < steps && ok; step_i++, step++) {
+        report(progress, progress_opaque, "denoise", step_i, steps);
+
+        if(dit->lup) {
+            h3_lup_ctx *ctx = h3_lup_get_ctx(dit->lup);
+            int lup_steps_lores = steps - ctx->steps;
+            if (step_i == lup_steps_lores) {
+                // Free old DiT activations
+                lup_free_dit(dit);
+                // Latent Upscaler Forward
+                lup_progress lup_state = {progress, progress_opaque};
+                ok = h3_lup_forward(dit->lup, video_latent,
+                                    &dit->latent_t, &dit->latent_h, &dit->latent_w,
+                                    lup_run_report, &lup_state, error, error_size);
+                if (!ok) {
+                    fail(error, error_size, "latent upscaler forward failed");
+                    break;
+                }
+                // Update DiT
+                ok = lup_update_dit(dit, progress, progress_opaque, error, error_size);
+                if (!ok) {
+                    h3_lup_free(dit->lup);
+                    dit->lup = NULL;
+                    fail(error, error_size, "latent upscaler update failed");
+                    break;
+                }
+                // Free Latent Upscaler
+                h3_lup_free(dit->lup);
+                dit->lup = NULL;
+                // Reset reuse policy
+                selected_count = h3_dit_reuse_schedule(
+                    ctx->steps, reuse_interval, selected, sizeof(selected));
+                custom_count = reuse_interval > 1 ?
+                    parse_reuse_steps(dit->sigmas.steps, selected) : 0;
+                if (selected_count < 0 || custom_count < 0) {
+                    fail(error, error_size,
+                         "H3_REUSE_STEPS must be increasing and include 0 and %d",
+                         dit->sigmas.steps - 1);
+                    return 0;
+                }
+                if (custom_count > 0) selected_count = custom_count;
+                if (reuse_interval > 1 && getenv("H3_PROFILE"))
+                    fprintf(stderr, "h3: %s reuse schedule has %d evaluations\n",
+                            custom_count > 0 ? "custom" : "selected", selected_count);
+                // Reset local function vars
+                video_count = h3_dit_video_elements(dit);
+                free(video_velocity);
+                video_velocity = malloc(video_count * sizeof(*video_velocity));
+                last_video = reuse_interval > 1 ? malloc(video_count * sizeof(*last_video)) : NULL;
+                previous_video = reuse_interval > 1 ? malloc(video_count * sizeof(*previous_video)) : NULL;
+                // Reset step for hi-res pass
+                step = 0;
+                report(progress, progress_opaque, "denoise", step_i, steps);
+            }
+        }
+
         int evaluate = selected[step];
         if (evaluate) {
-            ok = h3_dit_forward(dit, step, video_latent, audio_latent,
+            ok = h3_dit_forward(dit, step, *video_latent, audio_latent,
                                 video_velocity, audio_velocity,
                                 error, error_size);
             if (ok && reuse_interval > 1) {
@@ -3317,7 +3491,7 @@ int h3_dit_denoise_euler_preview(
         }
         if (ok) {
             ok = h3_euler_velocity_step(
-                     video_latent, video_velocity, video_count,
+                     *video_latent, video_velocity, video_count,
                      dit->sigmas.video[step], dit->sigmas.video[step + 1]) &&
                  h3_euler_velocity_step(
                      audio_latent, audio_velocity, audio_count,
@@ -3326,7 +3500,7 @@ int h3_dit_denoise_euler_preview(
                           "Euler solver rejected step %d", step);
         }
         if (ok && preview) {
-            const float *preview_latent = video_latent;
+            const float *preview_latent = *video_latent;
             float *estimate = NULL;
             if (preview_mode == H3_PREVIEW_ESTIMATE) {
                 /* x0 = x_t + sigma_t * v: the estimated clean sample implied
@@ -3340,7 +3514,7 @@ int h3_dit_denoise_euler_preview(
                 } else {
                     float sigma = dit->sigmas.video[step + 1];
                     for (size_t i = 0; i < video_count; i++)
-                        estimate[i] = video_latent[i] + sigma * video_velocity[i];
+                        estimate[i] = *video_latent[i] + sigma * video_velocity[i];
                     preview_latent = estimate;
                 }
             }
@@ -3352,9 +3526,8 @@ int h3_dit_denoise_euler_preview(
             }
             free(estimate);
         }
-        if (ok) report(progress, progress_opaque, "denoise", step + 1,
-                       dit->sigmas.steps);
     }
+    if (ok) report(progress, progress_opaque, "denoise", steps, steps);
     free(video_velocity); free(audio_velocity);
     free(last_video); free(last_audio);
     free(previous_video); free(previous_audio);
@@ -3362,7 +3535,7 @@ int h3_dit_denoise_euler_preview(
     return ok;
 }
 
-int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
+int h3_dit_denoise_euler(h3_dit *dit, float **video_latent,
                          float *audio_latent, int reuse_interval,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {

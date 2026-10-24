@@ -17,6 +17,14 @@
 #include <time.h>
 #include <unistd.h>
 
+static size_t gpu_dtype_size[] = {
+    4, // H3_GPU_F32
+    2, // H3_GPU_BF16
+    1, // H3_GPU_I8
+    4, // H3_GPU_U32
+    2, // H3_GPU_F16
+};
+
 @class H3GPU;
 @interface H3Tensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -97,6 +105,71 @@
 @implementation H3Conv
 @end
 
+@interface H3Norm : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *input;
+@property(nonatomic, strong) MPSGraphTensor *weight;
+@property(nonatomic, strong) MPSGraphTensor *bias;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *inoutShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *weightShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *biasShape;
+@end
+@implementation H3Norm
+@end
+
+@interface H3Embed : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *input;
+@property(nonatomic, strong) MPSGraphTensor *embed;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *inoutShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *embedShape;
+@end
+@implementation H3Embed
+@end
+
+@interface H3Pad : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *input;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+@end
+@implementation H3Pad
+@end
+
+@interface H3Slice : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *input;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+@end
+@implementation H3Slice
+@end
+
+@interface H3Blend : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *input;
+@property(nonatomic, strong) MPSGraphTensor *chunk;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *inoutShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *chunkShape;
+@end
+@implementation H3Blend
+@end
+
+@interface H3Interpolate : NSObject
+@property(nonatomic, strong) MPSGraph *graph;
+@property(nonatomic, strong) MPSGraphTensor *input;
+@property(nonatomic, strong) MPSGraphTensor *output;
+@property(nonatomic, strong) NSArray<NSNumber *> *inputShape;
+@property(nonatomic, strong) NSArray<NSNumber *> *outputShape;
+@end
+@implementation H3Interpolate
+@end
+
 @interface H3GPU : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
@@ -109,6 +182,12 @@
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Linear *> *linearCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3MLP *> *mlpCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Conv *> *convCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3Norm *> *normCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3Embed *> *embedCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3Pad *> *padCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3Slice *> *sliceCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3Blend *> *blendCache;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, H3Interpolate *> *interpCache;
 @property(nonatomic, strong) MPSCommandBuffer *mpsCommand;
 @property(nonatomic) BOOL reuseMPSCommandDefault;
 @property(nonatomic, copy) NSString *lastError;
@@ -5394,3 +5473,570 @@ int h3_gpu_lora_f16(h3_gpu *opaque, h3_gpu_tensor *inout,
                             MPSDataTypeFloat16);
 }
 
+static inline H3Interpolate *h3_gpu_interpolate_graph(H3GPU *gpu,
+                                    uint32_t c, uint32_t h, uint32_t w,
+                                    uint32_t h_out, uint32_t w_out,
+                                    MPSDataType dataType) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%u", c, h, w,
+                         h_out, w_out, (unsigned)dataType];
+        H3Interpolate *cached = gpu.interpCache[key];
+        if (cached) return cached;
+        H3Interpolate *interp = [[H3Interpolate alloc] init];
+        interp.graph = [[MPSGraph alloc] init];
+        interp.inputShape  = @[@(c), @(h), @(w)];
+        interp.outputShape = @[@(c), @(h_out), @(w_out)];
+        interp.input = [interp.graph placeholderWithShape:interp.inputShape dataType:dataType name:nil];
+        NSArray<NSNumber *> *outputSize = @[@(h_out), @(w_out)];
+        MPSGraphTensor *output = [interp.graph resizeTensor:interp.input size:outputSize
+                                          mode:MPSGraphResizeBilinear centerResult:NO alignCorners:NO
+                                          layout:MPSGraphTensorNamedDataLayoutCHW name:nil];
+        interp.output = [interp.graph castTensor:output toType:dataType name:nil];
+        gpu.interpCache[key] = interp;
+        return interp;
+    }
+}
+
+static int h3_gpu_interpolate_mps(H3GPU *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                            uint32_t c, uint32_t h, uint32_t w,
+                            uint32_t h_out, uint32_t w_out,
+                            MPSDataType dataType) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3Interpolate *interp = h3_gpu_interpolate_graph(gpu, c, h, w, h_out, w_out, dataType);
+    if (!interp) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, interp.inputShape, dataType, 0);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, interp.outputShape, dataType, 0);
+        NSMutableDictionary *feeds = [@{interp.input: input_data} mutableCopy];
+        NSDictionary *results = @{interp.output: output_data};
+        @try {
+            [interp.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph interpolate failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    //h3_gpu_stats stats = gpu.stats;
+    //stats.mps_conv_dispatches++;
+    //gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_interpolate_bf16(h3_gpu *opaque, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                            uint32_t c, uint32_t h, uint32_t w,
+                            uint32_t h_out, uint32_t w_out) {
+    H3GPU *gpu = GPU(opaque);
+    size_t output_count = (size_t)c * h_out * w_out;
+    size_t input_count = (size_t)c * h * w;
+    if (!h3_gpu_require_bf16(gpu, output, output_count, @"interpolate output") ||
+        !h3_gpu_require_bf16(gpu, input, input_count, @"interpolate input")) return 0;
+    return h3_gpu_interpolate_mps(gpu, output, input, c, h, w, h_out, w_out, MPSDataTypeBFloat16);
+}
+
+static inline H3Norm *h3_gpu_group_norm_graph(H3GPU *gpu,
+                                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                                    uint32_t groups,
+                                    MPSDataType dataType) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%u:%u", b, c, t, h, w,
+                            groups, (unsigned)dataType];
+        H3Norm *cached = gpu.normCache[key];
+        if (cached) return cached;
+        H3Norm *norm = [[H3Norm alloc] init];
+        norm.graph = [[MPSGraph alloc] init];
+        uint32_t c_per_group = c / groups;
+        norm.inoutShape  = @[ @(b), @(groups), @(c_per_group), @(t), @(h), @(w) ];
+        norm.weightShape = @[@1, @(groups), @(c_per_group), @1, @1, @1];
+        norm.biasShape   = @[@1, @(groups), @(c_per_group), @1, @1, @1];
+        norm.input  = [norm.graph placeholderWithShape:norm.inoutShape  dataType:dataType name:nil];
+        norm.weight = [norm.graph placeholderWithShape:norm.weightShape dataType:dataType name:nil];
+        norm.bias   = [norm.graph placeholderWithShape:norm.biasShape   dataType:dataType name:nil];
+        // Mean and variance
+        NSArray<NSNumber *> *axes = @[@2, @3, @4, @5];
+        MPSGraphTensor *mean = [norm.graph meanOfTensor:norm.input axes:axes name:nil];
+        MPSGraphTensor *variance = [norm.graph varianceOfTensor:norm.input meanTensor:mean axes:axes name:nil];
+        // Normalization
+        float epsilon = 1e-5f;
+        MPSGraphTensor *output = [norm.graph normalizationWithTensor:norm.input
+                                             meanTensor:mean varianceTensor:variance
+                                             gammaTensor:norm.weight betaTensor:norm.bias
+                                             epsilon:epsilon name:nil];
+        norm.output = [norm.graph castTensor:output toType:dataType name:nil];
+        gpu.normCache[key] = norm;
+        return norm;
+    }
+}
+
+static int h3_gpu_group_norm_mps(H3GPU *gpu, h3_gpu_tensor *output, h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight, const h3_gpu_tensor *bias,
+                            uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                            uint32_t groups, MPSDataType dataType) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3Norm *norm = h3_gpu_group_norm_graph(gpu, b, c, t, h, w, groups, dataType);
+    if (!norm) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, norm.inoutShape, dataType, 0);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, norm.inoutShape, dataType, 0);
+        MPSGraphTensorData *weight_data = h3_gpu_graph_data(
+            weight, norm.weightShape, dataType, 1);
+        MPSGraphTensorData *bias_data = h3_gpu_graph_data(
+            bias, norm.biasShape, dataType, 1);
+        NSMutableDictionary *feeds = [@{norm.input: input_data,
+                                        norm.weight: weight_data,
+                                        norm.bias: bias_data} mutableCopy];
+        NSDictionary *results = @{norm.output: output_data};
+        @try {
+            [norm.graph encodeToCommandBuffer:command feeds:feeds targetOperations:nil
+                resultsDictionary:results executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph group norm failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    //h3_gpu_stats stats = gpu.stats;
+    //stats.mps_conv_dispatches++;
+    //gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_group_norm_bf16(h3_gpu *opaque, h3_gpu_tensor *output, h3_gpu_tensor *input,
+                        const h3_gpu_tensor *weight, const h3_gpu_tensor *bias,
+                        uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                        uint32_t groups) {
+    H3GPU *gpu = GPU(opaque);
+    size_t inout_count = (size_t)b * c * t * h * w;
+    if (!h3_gpu_require_bf16(gpu, output, inout_count, @"group_norm output") ||
+        !h3_gpu_require_bf16(gpu, input, inout_count, @"group_norm input") ||
+        !h3_gpu_require_bf16(gpu, weight, c, @"group_norm weight") ||
+        !h3_gpu_require_bf16(gpu, bias, c, @"group_norm bias")) return 0;
+    return h3_gpu_group_norm_mps(gpu, output, input, weight, bias, b, c, t, h, w, groups, MPSDataTypeBFloat16);
+}
+
+static H3Conv *h3_gpu_conv3d_bf16_graph(H3GPU *gpu,
+                        uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                        uint32_t c_out, uint32_t groups,
+                        uint32_t kernel_t, uint32_t kernel_h, uint32_t kernel_w,
+                        uint32_t pad_t, uint32_t pad_h, uint32_t pad_w,
+                        uint32_t output_t, uint32_t output_h, uint32_t output_w) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:
+            @"3d:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u",
+            b, c, t, h, w, c_out, groups,
+            kernel_t, kernel_h, kernel_w,
+            pad_t, pad_h, pad_w];
+        H3Conv *cached = gpu.convCache[key];
+        if (cached) return cached;
+        H3Conv *conv = [[H3Conv alloc] init];
+        conv.graph = [[MPSGraph alloc] init];
+        // 5D Layout NCDHW: [B, C, D, H, W]
+        conv.inputShape  = @[@(b), @(c), @(t), @(h), @(w)];
+        // Weights Layout OIDHW: [Out_C, In_C, T, H, W]
+        conv.weightShape = @[@(c_out), @(c / groups), @(kernel_t), @(kernel_h), @(kernel_w)];
+        // Bias Layout NCDHW broadcast: [1, Out_C, 1, 1, 1]
+        conv.biasShape   = @[@1, @(c_out), @1, @1, @1];
+        // Output Shape NCDHW: [B, Out_C, Out_D, Out_H, Out_W]
+        conv.outputShape = @[@(b), @(c_out), @(output_t), @(output_h), @(output_w)];
+        conv.input  = [conv.graph placeholderWithShape:conv.inputShape  dataType:MPSDataTypeBFloat16 name:nil];
+        conv.weight = [conv.graph placeholderWithShape:conv.weightShape dataType:MPSDataTypeBFloat16 name:nil];
+        conv.bias   = [conv.graph placeholderWithShape:conv.biasShape   dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphConvolution3DOpDescriptor *descriptor = [MPSGraphConvolution3DOpDescriptor
+            descriptorWithStrideInX:1 strideInY:1 strideInZ:1
+            dilationRateInX:1 dilationRateInY:1 dilationRateInZ:1
+            groups:groups
+            paddingLeft:pad_w paddingRight:pad_w
+            paddingTop:pad_h paddingBottom:pad_h
+            paddingFront:pad_t paddingBack:pad_t
+            paddingStyle:MPSGraphPaddingStyleExplicit
+            dataLayout:MPSGraphTensorNamedDataLayoutNCDHW
+            weightsLayout:MPSGraphTensorNamedDataLayoutOIDHW];
+        MPSGraphTensor *output = [conv.graph convolution3DWithSourceTensor:conv.input weightsTensor:conv.weight
+                                                                descriptor:descriptor name:nil];
+        output = [conv.graph additionWithPrimaryTensor:output secondaryTensor:conv.bias name:nil];
+        conv.output = output;
+        gpu.convCache[key] = conv;
+        return conv;
+    }
+}
+
+int h3_gpu_conv3d_bf16(h3_gpu *opaque, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *weight, const h3_gpu_tensor *bias,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                    uint32_t c_out, uint32_t groups,
+                    uint32_t kernel_t, uint32_t kernel_h, uint32_t kernel_w,
+                    uint32_t pad_t, uint32_t pad_h, uint32_t pad_w) {
+    H3GPU *gpu = GPU(opaque);
+    if (!b || !c || !t || !h || !w || !c_out ||
+        !kernel_t || !kernel_h || !kernel_w)
+        return 0;
+    // Output dimension formula accounting for explicit padding on both ends
+    uint32_t stride_t = 1, stride_h = 1, stride_w = 1;
+    uint32_t output_t = (t + 2 * pad_t - kernel_t) / stride_t + 1;
+    uint32_t output_h = (h + 2 * pad_h - kernel_h) / stride_h + 1;
+    uint32_t output_w = (w + 2 * pad_w - kernel_w) / stride_w + 1;
+    size_t input_count  = (size_t)b * c * t * h * w;
+    size_t weight_count = (size_t)c_out * (c / groups) * kernel_t * kernel_h * kernel_w;
+    size_t output_count = (size_t)b * c_out * output_t * output_h * output_w;
+    if (!h3_gpu_require_elements(gpu, output, output_count, @"conv3d output") ||
+            TENSOR(output).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, input, input_count, @"conv3d input") ||
+            TENSOR(input).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, weight, weight_count, @"conv3d weight") ||
+            TENSOR(weight).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, bias, c_out, @"conv3d bias") ||
+            TENSOR(bias).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_command(gpu)) return 0;
+    H3Conv *conv = h3_gpu_conv3d_bf16_graph(
+        gpu, b, c, t, h, w, c_out, groups,
+        kernel_t, kernel_h, kernel_w,
+        pad_t, pad_h, pad_w,
+        output_t, output_h, output_w);
+    if (!conv) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, conv.inputShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *weight_data = h3_gpu_graph_data(
+            weight, conv.weightShape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *bias_data = h3_gpu_graph_data(
+            bias, conv.biasShape, MPSDataTypeBFloat16, 1);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, conv.outputShape, MPSDataTypeBFloat16, 0);
+        NSMutableDictionary *feeds = [@{conv.input: input_data,
+                                        conv.weight: weight_data,
+                                        conv.bias: bias_data} mutableCopy];
+        NSDictionary *results = @{conv.output: output_data};
+        @try {
+            [conv.graph encodeToCommandBuffer:command feeds:feeds targetOperations:nil
+                            resultsDictionary:results executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph conv3d bf16 failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_conv_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+static H3Embed *h3_gpu_scale_embed_bf16_graph(H3GPU *gpu, uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat: @"%u:%u:%u:%u:%u", b, c, t, h, w];
+        H3Embed *cached = gpu.embedCache[key];
+        if (cached) return cached;
+        H3Embed *emb = [[H3Embed alloc] init];
+        emb.graph = [[MPSGraph alloc] init];
+        emb.inoutShape  = @[@(b), @(c), @(t), @(h), @(w)];
+        uint32_t c_emb = c * 2;
+        emb.embedShape = @[ @1, @(c_emb), @1, @1, @1 ];
+        emb.input = [emb.graph placeholderWithShape:emb.inoutShape dataType:MPSDataTypeBFloat16 name:nil];
+        emb.embed  = [emb.graph placeholderWithShape:emb.embedShape dataType:MPSDataTypeBFloat16 name:nil];
+        // Slice scale: [B, 0 : channels, 1, 1, 1]
+        MPSGraphTensor *scale = [emb.graph sliceTensor:emb.embed dimension:1 start:0 length:c name:nil];
+        // Slice shift: [B, channels : channels, 1, 1, 1]
+        MPSGraphTensor *shift = [emb.graph sliceTensor:emb.embed dimension:1 start:c length:c name:nil];
+        // Create constant 1.0 scalar in bfloat16: (1.0 + scale)
+        MPSGraphTensor *one = [emb.graph constantWithScalar:1.0 dataType:MPSDataTypeBFloat16];
+        MPSGraphTensor *one_plus_scale = [emb.graph additionWithPrimaryTensor:scale secondaryTensor:one name:nil];
+        // Modulate tensor: scaled = input * (1.0 + scale)
+        MPSGraphTensor *scaled = [emb.graph multiplicationWithPrimaryTensor:emb.input secondaryTensor:one_plus_scale name:nil];
+        // Add shift: output = scaled + shift
+        MPSGraphTensor *output = [emb.graph additionWithPrimaryTensor:scaled secondaryTensor:shift name:nil];
+        emb.output = output;
+        gpu.embedCache[key] = emb;
+        return emb;
+    }
+}
+
+int h3_gpu_scale_embed_bf16(h3_gpu *opaque, h3_gpu_tensor *output, h3_gpu_tensor *input, const h3_gpu_tensor *embed,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w) {
+    H3GPU *gpu = GPU(opaque);
+    if (!b || !c || !t || !h || !w) return 0;
+    // Output dimension formula accounting for explicit padding on both ends
+    size_t inout_count = (size_t)b * c * t * h * w;
+    size_t embed_count = (size_t)c * 2;
+    if (!h3_gpu_require_elements(gpu, output, inout_count, @"scale_embed output") ||
+            TENSOR(output).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, input, inout_count, @"scale_embed input") ||
+            TENSOR(input).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, embed, embed_count, @"scale_embed embed") ||
+            TENSOR(embed).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_command(gpu)) return 0;
+    H3Embed *emb = h3_gpu_scale_embed_bf16_graph(gpu, b, c, t, h, w);
+    if (!emb) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, emb.inoutShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, emb.inoutShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *embed_data = h3_gpu_graph_data(
+            embed, emb.embedShape, MPSDataTypeBFloat16, 0);
+        NSMutableDictionary *feeds = [@{emb.input: input_data,
+                                        emb.embed: embed_data} mutableCopy];
+        NSDictionary *results = @{emb.output: output_data};
+        @try {
+            [emb.graph encodeToCommandBuffer:command feeds:feeds targetOperations:nil
+                            resultsDictionary:results executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph scale_embed failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    //h3_gpu_stats stats = gpu.stats;
+    //stats.mps_conv_dispatches++;
+    //gpu.stats = stats;
+    return 1;
+}
+
+static inline H3Pad *h3_gpu_temporal_pad_graph(H3GPU *gpu,
+                                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                                    uint32_t overlap, MPSDataType dataType) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%u:%u", b, c, t, h, w,
+                         overlap, (unsigned)dataType];
+        H3Pad *cached = gpu.padCache[key];
+        if (cached) return cached;
+        H3Pad *pad = [[H3Pad alloc] init];
+        pad.graph = [[MPSGraph alloc] init];
+        pad.inputShape = @[ @(b), @(c), @(t), @(h), @(w) ];
+        uint32_t t_pad = t + (overlap * 2);
+        pad.outputShape = @[@(b), @(c), @(t_pad), @(h), @(w)];
+        pad.input = [pad.graph placeholderWithShape:pad.inputShape dataType:dataType name:nil];
+        NSArray<NSNumber *> *leftPadding  = @[@0, @0, @(overlap), @0, @0];
+        NSArray<NSNumber *> *rightPadding = @[ @0, @0, @(overlap), @0, @0 ];
+        MPSGraphTensor *output = [pad.graph padTensor:pad.input withPaddingMode:MPSGraphPaddingModeClampToEdge
+                                    leftPadding:leftPadding rightPadding:rightPadding constantValue:0.0 name:nil];
+        pad.output = [pad.graph castTensor:output toType:dataType name:nil];
+        gpu.padCache[key] = pad;
+        return pad;
+    }
+}
+
+static int h3_gpu_temporal_pad_mps(H3GPU *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                            uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                            uint32_t overlap, MPSDataType dataType) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3Pad *pad = h3_gpu_temporal_pad_graph(gpu, b, c, t, h, w, overlap, dataType);
+    if (!pad) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, pad.inputShape, dataType, 0);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, pad.outputShape, dataType, 0);
+        NSMutableDictionary *feeds = [@{pad.input: input_data} mutableCopy];
+        NSDictionary *results = @{pad.output: output_data};
+        @try {
+            [pad.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph temporal pad failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    //h3_gpu_stats stats = gpu.stats;
+    //stats.mps_conv_dispatches++;
+    //gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_temporal_pad_bf16(h3_gpu *opaque, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                            uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                            uint32_t overlap) {
+    H3GPU *gpu = GPU(opaque);
+    size_t output_count = (size_t)b * c * (t + overlap * 2) * h * w;
+    size_t input_count = (size_t)b * c * t * h * w;
+    if (!h3_gpu_require_bf16(gpu, output, output_count, @"pad output") ||
+        !h3_gpu_require_bf16(gpu, input, input_count, @"pad input")) return 0;
+    return h3_gpu_temporal_pad_mps(gpu, output, input, b, c, t, h, w, overlap, MPSDataTypeBFloat16);
+}
+
+static inline H3Slice *h3_gpu_temporal_slice_graph(H3GPU *gpu,
+                                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                                    uint32_t start, uint32_t end,
+                                    MPSDataType dataType) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%u:%u:%u", b, c, t, h, w,
+                         start, end, (unsigned)dataType];
+        H3Slice *cached = gpu.sliceCache[key];
+        if (cached) return cached;
+        H3Slice *slice = [[H3Slice alloc] init];
+        slice.graph = [[MPSGraph alloc] init];
+        slice.inputShape = @[ @(b), @(c), @(t), @(h), @(w) ];
+        uint32_t count = end - start;
+        slice.outputShape = @[@(b), @(c), @(count), @(h), @(w)];
+        slice.input = [slice.graph placeholderWithShape:slice.inputShape dataType:dataType name:nil];
+        NSArray<NSNumber *> *starts  = @[ @(0), @(0), @(start), @(0), @(0) ];
+        NSArray<NSNumber *> *ends    = @[ @(b), @(c), @(end),   @(h), @(w) ];
+        NSArray<NSNumber *> *strides = @[ @(1), @(1), @(1),     @(1), @(1) ];
+        MPSGraphTensor *output = [slice.graph sliceTensor:slice.input
+                                    starts:starts ends:ends strides:strides name:nil];
+        slice.output = [slice.graph castTensor:output toType:dataType name:nil];
+        gpu.sliceCache[key] = slice;
+        return slice;
+    }
+}
+
+static int h3_gpu_temporal_slice_mps(H3GPU *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                            uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                            uint32_t start, uint32_t end,
+                            MPSDataType dataType) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3Slice *slice = h3_gpu_temporal_slice_graph(gpu, b, c, t, h, w, start, end, dataType);
+    if (!slice) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, slice.inputShape, dataType, 0);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, slice.outputShape, dataType, 0);
+        NSMutableDictionary *feeds = [@{slice.input: input_data} mutableCopy];
+        NSDictionary *results = @{slice.output: output_data};
+        @try {
+            [slice.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph interpolate failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    //h3_gpu_stats stats = gpu.stats;
+    //stats.mps_conv_dispatches++;
+    //gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_temporal_slice_bf16(h3_gpu *opaque, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                            uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                            uint32_t start, uint32_t end) {
+    H3GPU *gpu = GPU(opaque);
+    size_t output_count = (size_t)b * c * (end - start) * h * w;
+    size_t input_count = (size_t)b * c * t * h * w;
+    if (!h3_gpu_require_bf16(gpu, output, output_count, @"slice output") ||
+        !h3_gpu_require_bf16(gpu, input, input_count, @"slice input")) return 0;
+    return h3_gpu_temporal_slice_mps(gpu, output, input, b, c, t, h, w, start, end, MPSDataTypeBFloat16);
+}
+
+static H3Blend *h3_gpu_temporal_blend_graph(H3GPU *gpu,
+                                        uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                                        uint32_t t_chunk,
+                                        uint32_t overlap_start, uint32_t overlap_end,
+                                        uint32_t offset) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u:%u:%u:%u:%u:%u",
+            b, c, t, h, w, t_chunk, overlap_start, overlap_end, offset];
+        H3Blend *cached = gpu.blendCache[key];
+        if (cached) return cached;
+        H3Blend *blend = [[H3Blend alloc] init];
+        blend.graph = [[MPSGraph alloc] init];
+        blend.inoutShape  = @[@(b), @(c), @(t), @(h), @(w)];
+        blend.chunkShape  = @[@(b), @(c), @(t_chunk), @(h), @(w)];
+        blend.input = [blend.graph placeholderWithShape:blend.inoutShape dataType:MPSDataTypeBFloat16 name:nil];
+        blend.chunk = [blend.graph placeholderWithShape:blend.chunkShape dataType:MPSDataTypeBFloat16 name:nil];
+        // TODO: Cosine overlap instead of linear: start = ((1 - cos(coords * pi/overlap)) / 2) and end = ((1 + cos(coords * pi/overlap)) / 2)
+        MPSGraphTensor *chunk = blend.chunk;
+        // Start overlap
+        if (overlap_start > 0) {
+            NSArray<NSNumber *> *overlapShape = @[@1, @1, @(overlap_start), @1, @1];
+            MPSGraphTensor *coords = [blend.graph coordinateAlongAxis:2 withShape:overlapShape name:nil];
+            coords = [blend.graph castTensor:coords toType:MPSDataTypeBFloat16 name:nil];
+            MPSGraphTensor *one = [blend.graph constantWithScalar:1.0f dataType:MPSDataTypeBFloat16];
+            MPSGraphTensor *numer = [blend.graph additionWithPrimaryTensor:coords secondaryTensor:one name:nil];
+            MPSGraphTensor *denom = [blend.graph constantWithScalar:(float)(overlap_start + 1) dataType:MPSDataTypeBFloat16];
+            MPSGraphTensor *ramp = [blend.graph divisionWithPrimaryTensor:numer secondaryTensor:denom name:nil];
+            MPSGraphTensor *chunk_slice = [blend.graph sliceTensor:chunk dimension:2 start:0 length:overlap_start name:nil];
+            MPSGraphTensor *chunk_slice_weighted = [blend.graph multiplicationWithPrimaryTensor:chunk_slice secondaryTensor:ramp name:nil];
+            NSArray<NSNumber *> *starts = @[@0, @0, @0, @0, @0];
+            NSArray<NSNumber *> *ends = @[@(b), @(c), @(overlap_start), @(h), @(w)];
+            NSArray<NSNumber *> *strides = @[@1, @1, @1, @1, @1];
+            chunk = [blend.graph sliceUpdateDataTensor:chunk updateTensor:chunk_slice_weighted starts:starts ends:ends strides:strides name:nil];
+        }
+        // End overlap
+        if (overlap_end > 0) {
+            NSArray<NSNumber *> *overlapShape = @[@1, @1, @(overlap_end), @1, @1];
+            MPSGraphTensor *coords = [blend.graph coordinateAlongAxis:2 withShape:overlapShape name:nil];
+            coords = [blend.graph castTensor:coords toType:MPSDataTypeBFloat16 name:nil];
+            MPSGraphTensor *one = [blend.graph constantWithScalar:1.0f dataType:MPSDataTypeBFloat16];
+            MPSGraphTensor *numer = [blend.graph additionWithPrimaryTensor:coords secondaryTensor:one name:nil];
+            MPSGraphTensor *denom = [blend.graph constantWithScalar:(float)(overlap_end + 1) dataType:MPSDataTypeBFloat16];
+            MPSGraphTensor *ramp = [blend.graph divisionWithPrimaryTensor:numer secondaryTensor:denom name:nil];
+            MPSGraphTensor *ramp_dec = [blend.graph subtractionWithPrimaryTensor:one secondaryTensor:ramp name:nil];
+            uint32_t overlap_offset = t_chunk - overlap_end;
+            MPSGraphTensor *chunk_slice = [blend.graph sliceTensor:chunk dimension:2 start:overlap_offset length:overlap_end name:nil];
+            MPSGraphTensor *chunk_slice_weighted = [blend.graph multiplicationWithPrimaryTensor:chunk_slice secondaryTensor:ramp_dec name:nil];
+            NSArray<NSNumber *> *starts  = @[@0, @0, @(overlap_offset), @0, @0];
+            NSArray<NSNumber *> *ends    = @[@(b), @(c), @(t_chunk), @(h), @(w)];
+            NSArray<NSNumber *> *strides = @[@1, @1, @1, @1, @1];
+            chunk = [blend.graph sliceUpdateDataTensor:chunk updateTensor:chunk_slice_weighted starts:starts ends:ends strides:strides name:nil];
+        }
+        // Update output with windowed chunk
+        MPSGraphTensor *slice = [blend.graph sliceTensor:blend.input dimension:2 start:offset length:t_chunk name:nil];
+        MPSGraphTensor *slice_update = [blend.graph additionWithPrimaryTensor:slice secondaryTensor:chunk name:nil];
+        NSArray<NSNumber *> *starts  = @[@0, @0, @(offset), @0, @0];
+        NSArray<NSNumber *> *ends    = @[@(b), @(c), @(offset + t_chunk), @(h), @(w)];
+        NSArray<NSNumber *> *strides = @[@1, @1, @1, @1, @1];
+        MPSGraphTensor *output = [blend.graph sliceUpdateDataTensor:blend.input updateTensor:slice_update
+                                                starts:starts ends:ends strides:strides name:nil];
+        blend.output = output;
+        gpu.blendCache[key] = blend;
+        return blend;
+    }
+}
+
+int h3_gpu_temporal_blend_bf16(h3_gpu *opaque, h3_gpu_tensor *inout, const h3_gpu_tensor *chunk,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                    uint32_t t_chunk,
+                    uint32_t overlap_start, uint32_t overlap_end,
+                    uint32_t offset) {
+    H3GPU *gpu = GPU(opaque);
+    if (!b || !c || !t || !h || !w || !t_chunk) return 0;
+    // Output dimension formula accounting for explicit padding on both ends
+    size_t inout_count  = (size_t)b * c * t * h * w;
+    size_t chunk_count = (size_t)b * c * t_chunk * h * w;
+    if (!h3_gpu_require_elements(gpu, inout, inout_count, @"blend inout") ||
+            TENSOR(inout).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, chunk, chunk_count, @"blend chunk") ||
+            TENSOR(chunk).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_command(gpu)) return 0;
+    H3Blend *blend = h3_gpu_temporal_blend_graph(gpu, b, c, t, h, w, t_chunk, overlap_start, overlap_end, offset);
+    if (!blend) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *inout_data = h3_gpu_graph_data(
+            inout, blend.inoutShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *chunk_data = h3_gpu_graph_data(
+            chunk, blend.chunkShape, MPSDataTypeBFloat16, 0);
+        NSMutableDictionary *feeds = [@{blend.input: inout_data,
+                                        blend.chunk: chunk_data} mutableCopy];
+        NSDictionary *results = @{blend.output: inout_data};
+        @try {
+            [blend.graph encodeToCommandBuffer:command feeds:feeds targetOperations:nil
+                            resultsDictionary:results executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph blend failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    //h3_gpu_stats stats = gpu.stats;
+    //stats.mps_conv_dispatches++;
+    //gpu.stats = stats;
+    return 1;
+}

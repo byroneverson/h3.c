@@ -662,4 +662,36 @@ int h3_gpu_lora_f16(h3_gpu *gpu, h3_gpu_tensor *inout,
                     const h3_gpu_tensor *lora_b, const h3_gpu_tensor *lora_a,
                     uint32_t output_dim, uint32_t rank, uint32_t input_dim);
 
+int h3_gpu_interpolate_bf16(h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                    uint32_t c, uint32_t h, uint32_t w, uint32_t h_out, uint32_t w_out);
+
+int h3_gpu_group_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output, h3_gpu_tensor *input,
+                    const h3_gpu_tensor *weight, const h3_gpu_tensor *bias,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                    uint32_t groups);
+
+int h3_gpu_conv3d_bf16(h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *weight, const h3_gpu_tensor *bias,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                    uint32_t c_out, uint32_t groups,
+                    uint32_t kernel_t, uint32_t kernel_h, uint32_t kernel_w,
+                    uint32_t pad_t, uint32_t pad_h, uint32_t pad_w);
+
+int h3_gpu_scale_embed_bf16(h3_gpu *gpu, h3_gpu_tensor *output, h3_gpu_tensor *input, const h3_gpu_tensor *embed,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w);
+
+int h3_gpu_temporal_pad_bf16(h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                    uint32_t overlap);
+
+int h3_gpu_temporal_slice_bf16(h3_gpu *opaque, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                    uint32_t start, uint32_t end);
+
+int h3_gpu_temporal_blend_bf16(h3_gpu *gpu, h3_gpu_tensor *inout, const h3_gpu_tensor *chunk,
+                    uint32_t b, uint32_t c, uint32_t t, uint32_t h, uint32_t w,
+                    uint32_t t_chunk,
+                    uint32_t overlap_start, uint32_t overlap_end,
+                    uint32_t offset);
+
 #endif
