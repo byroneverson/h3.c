@@ -36,4 +36,16 @@ h3_gpu_tensor *h3_weight_load_f16_from_bf16(const h3_weight_store *store, h3_gpu
                                             const uint64_t *shape,
                                             char *error, size_t error_size);
 
+h3_gpu_tensor *h3_weight_load_bf16_lora(const h3_weight_store *store, h3_gpu *gpu,
+                                   const char *name, int ndim,
+                                   const uint64_t *shape,
+                                   const char *lora_a, const char *lora_b, uint64_t rank,
+                                   char *error, size_t error_size);
+
+h3_gpu_tensor *h3_weight_load_f16_from_bf16_lora(const h3_weight_store *store, h3_gpu *gpu,
+                                   const char *name, int ndim,
+                                   const uint64_t *shape,
+                                   const char *lora_a, const char *lora_b, uint64_t rank,
+                                   char *error, size_t error_size);
+
 #endif

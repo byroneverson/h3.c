@@ -216,3 +216,87 @@ h3_gpu_tensor *h3_weight_load_f16_from_bf16(const h3_weight_store *store, h3_gpu
     h3_gpu_submit(gpu);
     return tensor;
 }
+
+h3_gpu_tensor *h3_weight_load_bf16_lora(const h3_weight_store *store, h3_gpu *gpu,
+                                   const char *name, int ndim,
+                                   const uint64_t *shape,
+                                   const char *lora_a, const char *lora_b, uint64_t rank,
+                                   char *error, size_t error_size) {
+    // target tensor
+    h3_gpu_tensor *tensor = h3_weight_load_bf16(store, gpu, name, ndim, shape, error, error_size);
+    if (!tensor) {
+        return NULL;
+    }
+    if (!lora_a || !lora_b) return tensor;
+    // lora_a
+    uint64_t input_dim = shape[1];
+    uint64_t shape_a[] = {rank, input_dim};
+    h3_gpu_tensor *tensor_a = h3_weight_load_bf16(store, gpu, lora_a, 2, shape_a, error, error_size);
+    if (!tensor_a) {
+        return tensor;
+    }
+    // lora_b
+    uint64_t output_dim = shape[0];
+    uint64_t shape_b[] = {output_dim, rank};
+    h3_gpu_tensor *tensor_b = h3_weight_load_bf16(store, gpu, lora_b, 2, shape_b, error, error_size);
+    if (!tensor_b) {
+        h3_gpu_tensor_free(tensor_a);
+        return tensor;
+    }
+    // apply lora
+    h3_gpu_begin(gpu);
+    if (!h3_gpu_lora_bf16(gpu, tensor, tensor_b, tensor_a,
+                           (uint32_t)output_dim, (uint32_t)rank, (uint32_t)input_dim)) {
+        h3_gpu_tensor_free(tensor_a);
+        h3_gpu_tensor_free(tensor_b);
+        return tensor;
+    }
+    h3_gpu_submit(gpu);
+    // free loras
+    h3_gpu_tensor_free(tensor_a);
+    h3_gpu_tensor_free(tensor_b);
+    // return tensor
+    return tensor;
+}
+
+h3_gpu_tensor *h3_weight_load_f16_from_bf16_lora(const h3_weight_store *store, h3_gpu *gpu,
+                                   const char *name, int ndim,
+                                   const uint64_t *shape,
+                                   const char *lora_a, const char *lora_b, uint64_t rank,
+                                   char *error, size_t error_size) {
+    // target tensor
+    h3_gpu_tensor *tensor = h3_weight_load_f16_from_bf16(store, gpu, name, ndim, shape, error, error_size);
+    if (!tensor) {
+        return NULL;
+    }
+    if (!lora_a || !lora_b) return tensor;
+    // lora_a
+    uint64_t input_dim = shape[1];
+    uint64_t shape_a[] = {rank, input_dim};
+    h3_gpu_tensor *tensor_a = h3_weight_load_f16_from_bf16(store, gpu, lora_a, 2, shape_a, error, error_size);
+    if (!tensor_a) {
+        return tensor;
+    }
+    // lora_b
+    uint64_t output_dim = shape[0];
+    uint64_t shape_b[] = {output_dim, rank};
+    h3_gpu_tensor *tensor_b = h3_weight_load_f16_from_bf16(store, gpu, lora_b, 2, shape_b, error, error_size);
+    if (!tensor_b) {
+        h3_gpu_tensor_free(tensor_a);
+        return tensor;
+    }
+    // apply lora
+    h3_gpu_begin(gpu);
+    if (!h3_gpu_lora_f16(gpu, tensor, tensor_b, tensor_a,
+                           (uint32_t)output_dim, (uint32_t)rank, (uint32_t)input_dim)) {
+        h3_gpu_tensor_free(tensor_a);
+        h3_gpu_tensor_free(tensor_b);
+        return tensor;
+    }
+    h3_gpu_submit(gpu);
+    // free loras
+    h3_gpu_tensor_free(tensor_a);
+    h3_gpu_tensor_free(tensor_b);
+    // return tensor
+    return tensor;
+}
