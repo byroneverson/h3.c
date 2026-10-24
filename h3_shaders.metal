@@ -4330,3 +4330,356 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+inline half h3_bf16_to_f16(ushort value) {
+    return half(as_type<float>(uint(value) << 16));
+}
+
+inline ushort h3_f16_to_bf16(half value) {
+    uint bits = as_type<uint>(float(value));
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return ushort(bits >> 16);
+}
+
+kernel void h3_cast_f32_to_f16(device const float *input [[buffer(0)]],
+                                device half *output [[buffer(1)]],
+                                constant uint &count [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = half(input[gid]);
+}
+
+kernel void h3_cast_f16_to_f32(device const half *input [[buffer(0)]],
+                                device float *output [[buffer(1)]],
+                                constant uint &count [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = float(input[gid]);
+}
+
+kernel void h3_cast_bf16_to_f16(device const ushort *input [[buffer(0)]],
+                                device half *output [[buffer(1)]],
+                                constant uint &count [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = h3_bf16_to_f16(input[gid]);
+}
+
+kernel void h3_cast_f16_to_bf16(device const half *input [[buffer(0)]],
+                                device ushort *output [[buffer(1)]],
+                                constant uint &count [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid < count) output[gid] = h3_f16_to_bf16(input[gid]);
+}
+
+kernel void h3_linear_f16_input_bf16(device const ushort *input [[buffer(0)]],
+                          device const half *weight [[buffer(1)]],
+                          device const half *bias [[buffer(2)]],
+                          device half *output [[buffer(3)]],
+                          constant linear_args &args [[buffer(4)]],
+                          uint2 tid [[thread_position_in_threadgroup]],
+                          uint2 group [[threadgroup_position_in_grid]]) {
+    /* Adapted from Iris's short-sequence Qwen path. Each 16x16 weight/input
+     * tile is loaded once per threadgroup instead of once per output scalar. */
+    threadgroup ushort input_tile[16][17]; // 17 instead of 16 to relieve shared memory bank conflict...
+    threadgroup half weight_tile[16][16]; //... during the fma loop (introduce a memory staggering)
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = args.has_bias && column < args.output_dim ? bias[column] : 0.0f;
+    uint tile_count = (args.input_dim + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        input_tile[tid.y][tid.x] =
+            row < args.rows && input_k < args.input_dim ? input[row * args.input_dim + input_k] : 0.0f;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.output_dim && weight_k < args.input_dim ? weight[column * args.input_dim + weight_k] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++)
+            sum = fma(h3_bf16_to_f32(input_tile[tid.y][k]), float(weight_tile[k][tid.x]), sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < args.rows && column < args.output_dim)
+        output[row * args.output_dim + column] = half(sum);
+}
+
+kernel void h3_linear_f16_scale_64(device const half *input [[buffer(0)]],
+                          device const half *weight [[buffer(1)]],
+                          device const half *bias [[buffer(2)]],
+                          device ushort *output [[buffer(3)]],
+                          constant linear_args &args [[buffer(4)]],
+                          uint2 tid [[thread_position_in_threadgroup]],
+                          uint2 group [[threadgroup_position_in_grid]]) {
+    /* Adapted from Iris's short-sequence Qwen path. Each 16x16 weight/input
+     * tile is loaded once per threadgroup instead of once per output scalar. */
+    threadgroup half input_tile[16][17]; // 17 instead of 16 to relieve shared memory bank conflict...
+    threadgroup half weight_tile[16][16]; //... during the fma loop (introduce a memory staggering)
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = args.has_bias && column < args.output_dim ? bias[column] : 0.0f;
+    uint tile_count = (args.input_dim + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        input_tile[tid.y][tid.x] =
+            row < args.rows && input_k < args.input_dim ? (input[row * args.input_dim + input_k] / 64.0) : 0.0f;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.output_dim && weight_k < args.input_dim ? weight[column * args.input_dim + weight_k] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++)
+            sum = fma(float(input_tile[tid.y][k]), float(weight_tile[k][tid.x]), sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < args.rows && column < args.output_dim)
+        output[row * args.output_dim + column] = h3_f32_to_bf16(sum * 64.0);
+}
+
+kernel void h3_qkv_rope_f16_coop_uncached(
+                             device const half *qkv [[buffer(0)]],
+                             device const half *q_weight [[buffer(1)]],
+                             device const half *k_weight [[buffer(2)]],
+                             device const half *rope_cos [[buffer(3)]],
+                             device const half *rope_sin [[buffer(4)]],
+                             device half *query [[buffer(5)]],
+                             device half *key [[buffer(6)]],
+                             device half *value [[buffer(7)]],
+                             constant qkv_args &args [[buffer(8)]],
+                             uint2 group [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint WIDTH = 128;
+    constexpr uint HEADS_PER_GROUP = 4;
+    uint head = group.x * HEADS_PER_GROUP + simdgroup;
+    uint row = group.y;
+    if (head >= args.heads || row >= args.sequence) return;
+    uint inner = args.heads * args.head_dim;
+    uint row_base = row * inner * 3;
+    uint q_base = row_base + head * args.head_dim;
+    uint k_base = q_base + inner;
+    uint v_base = q_base + inner * 2;
+    if (args.grouped) {
+        q_base = row_base + head * args.head_dim * 3;
+        k_base = q_base + args.head_dim;
+        v_base = k_base + args.head_dim;
+    }
+
+    threadgroup float q_inverse[HEADS_PER_GROUP];
+    threadgroup float k_inverse[HEADS_PER_GROUP];
+    if (lane == 0) {
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        for (uint d = 0; d < WIDTH; d++) {
+            float q_element = float(qkv[q_base + d]);
+            float k_element = float(qkv[k_base + d]);
+            q_sum = fma(q_element, q_element, q_sum);
+            k_sum = fma(k_element, k_element, k_sum);
+        }
+        q_inverse[simdgroup] =
+            rsqrt(q_sum / float(args.head_dim) + args.epsilon);
+        k_inverse[simdgroup] =
+            rsqrt(k_sum / float(args.head_dim) + args.epsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint dimension = lane; dimension < WIDTH; dimension += 32) {
+        float q0 = float(qkv[q_base + dimension]) *
+                   q_inverse[simdgroup] *
+                   float(q_weight[dimension]);
+        float k0 = float(qkv[k_base + dimension]) *
+                   k_inverse[simdgroup] *
+                   float(k_weight[dimension]);
+        if (dimension < args.rope_half) {
+            uint pair = dimension + args.rope_half;
+            float q1 = float(qkv[q_base + pair]) *
+                       q_inverse[simdgroup] *
+                       float(q_weight[pair]);
+            float k1 = float(qkv[k_base + pair]) *
+                       k_inverse[simdgroup] *
+                       float(k_weight[pair]);
+            float c = float(
+                rope_cos[row * args.rope_half + dimension]);
+            float s = float(
+                rope_sin[row * args.rope_half + dimension]);
+            q0 = q0 * c - q1 * s;
+            k0 = k0 * c - k1 * s;
+        } else if (dimension < args.rope_half * 2) {
+            uint pair = dimension - args.rope_half;
+            float q1 = float(qkv[q_base + pair]) *
+                       q_inverse[simdgroup] *
+                       float(q_weight[pair]);
+            float k1 = float(qkv[k_base + pair]) *
+                       k_inverse[simdgroup] *
+                       float(k_weight[pair]);
+            float c = float(
+                rope_cos[row * args.rope_half + pair]);
+            float s = float(
+                rope_sin[row * args.rope_half + pair]);
+            q0 = q0 * c + q1 * s;
+            k0 = k0 * c + k1 * s;
+        }
+        uint output_index =
+            (row * args.heads + head) * args.head_dim + dimension;
+        query[output_index] = half(q0);
+        key[output_index] = half(k0);
+        value[output_index] = qkv[v_base + dimension];
+    }
+}
+
+kernel void h3_qkv_rope_f16_coop(
+                             device const half *qkv [[buffer(0)]],
+                             device const half *q_weight [[buffer(1)]],
+                             device const half *k_weight [[buffer(2)]],
+                             device const half *rope_cos [[buffer(3)]],
+                             device const half *rope_sin [[buffer(4)]],
+                             device half *query [[buffer(5)]],
+                             device half *key [[buffer(6)]],
+                             device half *value [[buffer(7)]],
+                             constant qkv_args &args [[buffer(8)]],
+                             uint2 group [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint WIDTH = 128;
+    constexpr uint VEC_WIDTH = WIDTH / 4; // 32 vector elements
+    constexpr uint HEADS_PER_GROUP = 4;
+    uint head = group.x * HEADS_PER_GROUP + simdgroup;
+    uint row = group.y;
+    if (head >= args.heads || row >= args.sequence) return;
+    // Convert base pointers to vector widths to optimize memory pipelines
+    device const half4 *qkv4 = (device const half4 *)qkv;
+    device const half4 *q_w4  = (device const half4 *)q_weight;
+    device const half4 *k_w4  = (device const half4 *)k_weight;
+    uint inner = args.heads * args.head_dim;
+    uint vec_inner = inner / 4;
+    uint vec_head_dim = args.head_dim / 4;
+    uint vec_row_base = row * vec_inner * 3;
+    uint vec_q_base = vec_row_base + head * vec_head_dim;
+    uint vec_k_base = vec_q_base + vec_inner;
+    uint vec_v_base = vec_q_base + vec_inner * 2;
+    if (args.grouped) {
+        vec_q_base = vec_row_base + head * vec_head_dim * 3;
+        vec_k_base = vec_q_base + vec_head_dim;
+        vec_v_base = vec_k_base + vec_head_dim;
+    }
+    // Allocate threadgroup cache as float4 to avoid type casting inside loops
+    threadgroup float4 q_cache[HEADS_PER_GROUP * VEC_WIDTH];
+    threadgroup float4 k_cache[HEADS_PER_GROUP * VEC_WIDTH];
+    uint cache_base = simdgroup * VEC_WIDTH;
+    // Fast 128-bit Coalesced Load: Each lane loads exactly 1 float4 (4 elements)
+    // Since VEC_WIDTH = 32 and SIMD size = 32, this is a clean, single-cycle map!
+    q_cache[cache_base + lane] = float4(qkv4[vec_q_base + lane]);
+    k_cache[cache_base + lane] = float4(qkv4[vec_k_base + lane]);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    // Compute parallel partial sums using all threads via hardware lanes
+    float4 q_f4 = q_cache[cache_base + lane];
+    float4 k_f4 = k_cache[cache_base + lane];
+    float local_q_sum = dot(q_f4, q_f4);
+    float local_k_sum = dot(k_f4, k_f4);
+    // Low-latency reduction: loops are completely gone.
+    float total_q_sum = simd_sum(local_q_sum);
+    float total_k_sum = simd_sum(local_k_sum);
+    // Scale factors are now shared uniformly across all SIMD threads without a stall
+    float q_inverse = rsqrt(total_q_sum / float(args.head_dim) + args.epsilon);
+    float k_inverse = rsqrt(total_k_sum / float(args.head_dim) + args.epsilon);
+    // Load RMSNorm vector weights
+    float4 q0 = q_f4 * q_inverse * float4(q_w4[lane]);
+    float4 k0 = k_f4 * k_inverse * float4(k_w4[lane]);
+    // Overwrite the cache with fully scaled/normalized values
+    q_cache[cache_base + lane] = q0;
+    k_cache[cache_base + lane] = k0;
+    simdgroup_barrier(mem_flags::mem_threadgroup); // Synchronize pre-scaled cache
+    // Optimized Vectorized RoPE
+    uint vec_rope_half = args.rope_half / 4;
+    if (lane < vec_rope_half) {
+        uint vec_pair = lane + vec_rope_half;
+        float4 q1 = q_cache[cache_base + vec_pair]; // * q_inverse * float4(q_w4[vec_pair]);
+        float4 k1 = k_cache[cache_base + vec_pair]; // * k_inverse * float4(k_w4[vec_pair]);
+        device const half4   *cos_ptr = (device const half4 *)rope_cos;
+        device const half4   *sin_ptr = (device const half4 *)rope_sin;
+        uint rope_offset = row * vec_rope_half + lane;
+        float4 c = float4(cos_ptr[rope_offset]);
+        float4 s = float4(sin_ptr[rope_offset]);
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (lane < vec_rope_half * 2) {
+        uint vec_pair = lane - vec_rope_half;
+        float4 q1 = q_cache[cache_base + vec_pair]; // * q_inverse * float4(q_w4[vec_pair]);
+        float4 k1 = k_cache[cache_base + vec_pair]; // * k_inverse * float4(k_w4[vec_pair]);
+        device const half4 *cos_ptr = (device const half4 *)rope_cos;
+        device const half4 *sin_ptr = (device const half4 *)rope_sin;
+        uint rope_offset = row * vec_rope_half + vec_pair;
+        float4 c = float4(cos_ptr[rope_offset]);
+        float4 s = float4(sin_ptr[rope_offset]);
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    // Output Vector Coalescing
+    device half4 *query4 = (device half4 *)query;
+    device half4 *key4   = (device half4 *)key;
+    device half4 *value4 = (device half4 *)value;
+    uint vec_output_index = (row * args.heads + head) * vec_head_dim + lane;
+    query4[vec_output_index] = half4(q0);
+    key4[vec_output_index]   = half4(k0);
+    value4[vec_output_index] = qkv4[vec_v_base + lane];
+}
+
+
+kernel void h3_qkv_rope_f16(device const half *qkv [[buffer(0)]],
+                             device const half *q_weight [[buffer(1)]],
+                             device const half *k_weight [[buffer(2)]],
+                             device const half *rope_cos [[buffer(3)]],
+                             device const half *rope_sin [[buffer(4)]],
+                             device half *query [[buffer(5)]],
+                             device half *key [[buffer(6)]],
+                             device half *value [[buffer(7)]],
+                             constant qkv_args &args [[buffer(8)]],
+                             uint3 gid [[thread_position_in_grid]]) {
+    uint dimension = gid.x;
+    uint head = gid.y;
+    uint row = gid.z;
+    if (dimension >= args.head_dim || head >= args.heads || row >= args.sequence) return;
+    uint inner = args.heads * args.head_dim;
+    uint row_base = row * inner * 3;
+    uint q_base = row_base + head * args.head_dim;
+    uint k_base = q_base + inner;
+    uint v_base = q_base + inner * 2;
+    if (args.grouped) {
+        q_base = row_base + head * args.head_dim * 3;
+        k_base = q_base + args.head_dim;
+        v_base = k_base + args.head_dim;
+    }
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (uint d = 0; d < args.head_dim; d++) {
+        float q = float(qkv[q_base + d]);
+        float k = float(qkv[k_base + d]);
+        q_sum = fma(q, q, q_sum);
+        k_sum = fma(k, k, k_sum);
+    }
+    float q_inverse = rsqrt(q_sum / float(args.head_dim) + args.epsilon);
+    float k_inverse = rsqrt(k_sum / float(args.head_dim) + args.epsilon);
+    float q0 = float(qkv[q_base + dimension]) * q_inverse *
+               float(q_weight[dimension]);
+    float k0 = float(qkv[k_base + dimension]) * k_inverse *
+               float(k_weight[dimension]);
+    if (dimension < args.rope_half) {
+        uint pair = dimension + args.rope_half;
+        float q1 = float(qkv[q_base + pair]) * q_inverse *
+                   float(q_weight[pair]);
+        float k1 = float(qkv[k_base + pair]) * k_inverse *
+                   float(k_weight[pair]);
+        float c = float(rope_cos[row * args.rope_half + dimension]);
+        float s = float(rope_sin[row * args.rope_half + dimension]);
+        q0 = q0 * c - q1 * s;
+        k0 = k0 * c - k1 * s;
+    } else if (dimension < args.rope_half * 2) {
+        uint pair = dimension - args.rope_half;
+        float q1 = float(qkv[q_base + pair]) * q_inverse *
+                   float(q_weight[pair]);
+        float k1 = float(qkv[k_base + pair]) * k_inverse *
+                   float(k_weight[pair]);
+        float c = float(rope_cos[row * args.rope_half + pair]);
+        float s = float(rope_sin[row * args.rope_half + pair]);
+        q0 = q0 * c + q1 * s;
+        k0 = k0 * c + k1 * s;
+    }
+    uint output_index = (row * args.heads + head) * args.head_dim + dimension;
+    query[output_index] = half(q0);
+    key[output_index] = half(k0);
+    value[output_index] = qkv[v_base + dimension];
+}

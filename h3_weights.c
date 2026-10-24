@@ -200,3 +200,19 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_F32,
                        error, error_size);
 }
+
+h3_gpu_tensor *h3_weight_load_f16_from_bf16(const h3_weight_store *store, h3_gpu *gpu,
+                                   const char *name, int ndim,
+                                   const uint64_t *shape,
+                                   char *error, size_t error_size) {
+    h3_gpu_tensor *tensor = load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_BF16, error, error_size);
+    if (!tensor) return NULL;
+    size_t elements = h3_gpu_tensor_elements(tensor);
+    h3_gpu_begin(gpu);
+    if (!h3_gpu_cast_bf16_to_f16_inplace(gpu, tensor, (uint32_t)elements)) {
+        h3_gpu_tensor_free(tensor);
+        return NULL;
+    }
+    h3_gpu_submit(gpu);
+    return tensor;
+}

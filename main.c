@@ -63,6 +63,7 @@ static void usage(const char *program) {
         "      --preview-mode M   Preview reconstruction: raw (default, shows the\n"
         "                         literal noisy sample) or estimate (reconstructs\n"
         "                         the estimated clean sample, sharpens earlier)\n"
+        "      --use-f16-dit      Use f16 for dit blocks (Amduraznak's fix modified for M1)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
         "  -h, --help             Show this help\n",
@@ -258,6 +259,7 @@ int main(int argc, char **argv) {
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
            OPT_PREVIEW_FRAMES, OPT_PREVIEW_MODE,
+           OPT_USE_F16_DIT,
            OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
@@ -311,6 +313,7 @@ int main(int argc, char **argv) {
         {"zoom", required_argument, NULL, OPT_ZOOM},
         {"preview-frames", required_argument, NULL, OPT_PREVIEW_FRAMES},
         {"preview-mode", required_argument, NULL, OPT_PREVIEW_MODE},
+        {"use-f16-dit", no_argument, NULL, OPT_USE_F16_DIT},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
         {"help", no_argument, NULL, 'h'},
@@ -481,6 +484,9 @@ int main(int argc, char **argv) {
                             "h3: --preview-mode must be raw or estimate\n");
                     return 2;
                 }
+                break;
+            case OPT_USE_F16_DIT:
+                params.use_f16_dit = 1;
                 break;
             case OPT_PROFILE: profile = 1; break;
             case OPT_INFO: info = 1; break;

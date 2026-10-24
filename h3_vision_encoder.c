@@ -375,14 +375,14 @@ static h3_gpu_tensor *run_merger(const h3_weight_store *weights, h3_gpu *gpu,
     h3_gpu_tensor *fc2_b = bf1(weights, gpu, NAME("linear_fc2.bias"),
                                 OUTPUT_WIDTH, error, error_size);
 #undef NAME
-    h3_gpu_tensor *norm = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)patch_rows * VISION_HIDDEN);
-    h3_gpu_tensor *fc1 = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)rows * MERGE_DIM);
-    h3_gpu_tensor *activated = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)rows * MERGE_DIM);
-    h3_gpu_tensor *output = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)rows * OUTPUT_WIDTH);
+    h3_gpu_tensor *norm = h3_gpu_tensor_new(
+        gpu, (size_t)patch_rows * VISION_HIDDEN, H3_GPU_BF16);
+    h3_gpu_tensor *fc1 = h3_gpu_tensor_new(
+        gpu, (size_t)rows * MERGE_DIM, H3_GPU_BF16);
+    h3_gpu_tensor *activated = h3_gpu_tensor_new(
+        gpu, (size_t)rows * MERGE_DIM, H3_GPU_BF16);
+    h3_gpu_tensor *output = h3_gpu_tensor_new(
+        gpu, (size_t)rows * OUTPUT_WIDTH, H3_GPU_BF16);
     if (!norm_w || !norm_b || !fc1_w || !fc1_b || !fc2_w || !fc2_b ||
         !norm || !fc1 || !activated || !output) {
         if (!error || !*error)
@@ -487,14 +487,14 @@ int h3_vision_encode_bf16(const char *weight_directory,
     free(position_table); position_table = NULL;
     free_tensor(&position_weight);
 
-    h3_gpu_tensor *patches = h3_gpu_tensor_from_bf16(
-        gpu, patch_data, patch_elements);
-    h3_gpu_tensor *position = h3_gpu_tensor_from_bf16(
-        gpu, position_data, hidden_elements);
-    h3_gpu_tensor *rope_cos = h3_gpu_tensor_from_bf16(
-        gpu, rope_cos_data, (size_t)rows * VISION_ROPE_HALF);
-    h3_gpu_tensor *rope_sin = h3_gpu_tensor_from_bf16(
-        gpu, rope_sin_data, (size_t)rows * VISION_ROPE_HALF);
+    h3_gpu_tensor *patches = h3_gpu_tensor_load(
+        gpu, patch_data, patch_elements, H3_GPU_BF16);
+    h3_gpu_tensor *position = h3_gpu_tensor_load(
+        gpu, position_data, hidden_elements, H3_GPU_BF16);
+    h3_gpu_tensor *rope_cos = h3_gpu_tensor_load(
+        gpu, rope_cos_data, (size_t)rows * VISION_ROPE_HALF, H3_GPU_BF16);
+    h3_gpu_tensor *rope_sin = h3_gpu_tensor_load(
+        gpu, rope_sin_data, (size_t)rows * VISION_ROPE_HALF, H3_GPU_BF16);
     free(patch_data); patch_data = NULL;
     free(position_data); position_data = NULL;
     free(rope_cos_data); rope_cos_data = NULL;
@@ -506,7 +506,7 @@ int h3_vision_encode_bf16(const char *weight_directory,
     h3_gpu_tensor *patch_b = bf1(weights, gpu,
         "model.visual.patch_embed.proj.bias", VISION_HIDDEN,
         error, error_size);
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
+    h3_gpu_tensor *hidden = h3_gpu_tensor_new(gpu, hidden_elements, H3_GPU_BF16);
     if (!patches || !position || !rope_cos || !rope_sin || !patch_w ||
         !patch_b || !hidden ||
         !gpu_op(gpu, h3_gpu_begin(gpu), "begin Qwen vision patch embed",
@@ -533,17 +533,17 @@ int h3_vision_encode_bf16(const char *weight_directory,
     free_tensor(&patch_w); free_tensor(&patch_b);
     debug_tensor("patch+position", hidden, hidden_elements);
 
-    h3_gpu_tensor *norm = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
-    h3_gpu_tensor *qkv = h3_gpu_tensor_new_bf16(gpu, hidden_elements * 3);
-    h3_gpu_tensor *query = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
-    h3_gpu_tensor *key = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
-    h3_gpu_tensor *value = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
-    h3_gpu_tensor *heads = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
-    h3_gpu_tensor *branch = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
-    h3_gpu_tensor *fc1 = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)rows * VISION_INTERMEDIATE);
-    h3_gpu_tensor *activated = h3_gpu_tensor_new_bf16(
-        gpu, (size_t)rows * VISION_INTERMEDIATE);
+    h3_gpu_tensor *norm = h3_gpu_tensor_new(gpu, hidden_elements, H3_GPU_BF16);
+    h3_gpu_tensor *qkv = h3_gpu_tensor_new(gpu, hidden_elements * 3, H3_GPU_BF16);
+    h3_gpu_tensor *query = h3_gpu_tensor_new(gpu, hidden_elements, H3_GPU_BF16);
+    h3_gpu_tensor *key = h3_gpu_tensor_new(gpu, hidden_elements, H3_GPU_BF16);
+    h3_gpu_tensor *value = h3_gpu_tensor_new(gpu, hidden_elements, H3_GPU_BF16);
+    h3_gpu_tensor *heads = h3_gpu_tensor_new(gpu, hidden_elements, H3_GPU_BF16);
+    h3_gpu_tensor *branch = h3_gpu_tensor_new(gpu, hidden_elements, H3_GPU_BF16);
+    h3_gpu_tensor *fc1 = h3_gpu_tensor_new(
+        gpu, (size_t)rows * VISION_INTERMEDIATE, H3_GPU_BF16);
+    h3_gpu_tensor *activated = h3_gpu_tensor_new(
+        gpu, (size_t)rows * VISION_INTERMEDIATE, H3_GPU_BF16);
     h3_gpu_tensor *deepstack[H3_VISION_DEEPSTACKS] = {NULL, NULL, NULL};
     h3_gpu_tensor *merged = NULL;
     int ok = norm && qkv && query && key && value && heads && branch && fc1 &&

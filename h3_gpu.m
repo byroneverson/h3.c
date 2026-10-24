@@ -432,7 +432,13 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
             @"h3_geglu_f32", @"h3_clip_f32",
             @"h3_vae_encoder_pad_f32",
-            @"h3_vae_encoder_group_norm_silu_f32"
+            @"h3_vae_encoder_group_norm_silu_f32",
+            @"h3_gpu_standardize_f32", @"h3_gpu_unstandardize_f32",
+            @"h3_cast_f32_to_f16", @"h3_cast_f16_to_f32",
+            @"h3_cast_bf16_to_f16", @"h3_cast_f16_to_bf16",
+            @"h3_linear_f16_input_bf16", @"h3_linear_f16_scale_64",
+            @"h3_qkv_rope_f16", @"h3_qkv_rope_f16_coop",
+            @"h3_qkv_rope_f16_coop_uncached"
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
@@ -546,10 +552,10 @@ int h3_gpu_has_int8_mlp(const h3_gpu *opaque) {
     return gpu.tensorOpsEnabled;
 }
 
-static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
-                                        size_t elements, size_t item_size,
-                                        h3_gpu_dtype dtype) {
+h3_gpu_tensor *h3_gpu_tensor_load(h3_gpu *opaque, const void *values,
+                                        size_t elements, h3_gpu_dtype dtype) {
     H3GPU *gpu = GPU(opaque);
+    const size_t item_size = gpu_dtype_size[dtype];
     if (!gpu || elements > SIZE_MAX / item_size) return NULL;
     size_t bytes = elements * item_size;
     H3Tensor *tensor = [[H3Tensor alloc] init];
@@ -574,31 +580,8 @@ static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
     return (__bridge_retained h3_gpu_tensor *)tensor;
 }
 
-h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements) {
-    return h3_gpu_tensor_new(gpu, NULL, elements, sizeof(float), H3_GPU_F32);
-}
-
-h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements) {
-    return h3_gpu_tensor_new(gpu, NULL, elements, sizeof(uint16_t), H3_GPU_BF16);
-}
-
-h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements) {
-    return h3_gpu_tensor_new(gpu, NULL, elements, sizeof(int8_t), H3_GPU_I8);
-}
-
-h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
-                                      size_t elements) {
-    return h3_gpu_tensor_new(gpu, values, elements, sizeof(float), H3_GPU_F32);
-}
-
-h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
-                                       size_t elements) {
-    return h3_gpu_tensor_new(gpu, values, elements, sizeof(uint16_t), H3_GPU_BF16);
-}
-
-h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
-                                      size_t elements) {
-    return h3_gpu_tensor_new(gpu, values, elements, sizeof(uint32_t), H3_GPU_U32);
+h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, size_t elements, h3_gpu_dtype dtype) {
+    return h3_gpu_tensor_load(opaque, NULL, elements, dtype);
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
@@ -674,7 +657,7 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
         return (__bridge_retained h3_gpu_tensor *)tensor;
     }
     h3_gpu_tensor *opaque_tensor = h3_gpu_tensor_new(
-        opaque, NULL, elements, item_size, dtype);
+        opaque, elements, dtype);
     if (!opaque_tensor) return NULL;
     H3Tensor *tensor = TENSOR(opaque_tensor);
     int descriptor = open(path, O_RDONLY | O_CLOEXEC);
@@ -1245,29 +1228,20 @@ int h3_gpu_silu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         });
 }
 
-int h3_gpu_cast_f32_to_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
-                            const h3_gpu_tensor *input, uint32_t elements) {
+int h3_gpu_cast(h3_gpu *opaque,
+                h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                uint32_t elements) {
+    H3Tensor *t_out = TENSOR(output);
+    H3Tensor *t_in  = TENSOR(input);
+    if (t_out.dtype == t_in.dtype) return 1;
     H3GPU *gpu = GPU(opaque);
     if (!h3_gpu_require_elements(gpu, input, elements, @"cast input") ||
-        TENSOR(input).dtype != H3_GPU_F32 ||
-        !h3_gpu_require_elements(gpu, output, elements, @"cast output") ||
-        TENSOR(output).dtype != H3_GPU_BF16) return 0;
-    return h3_gpu_dispatch_1d(gpu, @"h3_cast_f32_to_bf16", elements,
-        ^(id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
-            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
-            [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
-        });
-}
-
-int h3_gpu_cast_bf16_to_f32(h3_gpu *opaque, h3_gpu_tensor *output,
-                            const h3_gpu_tensor *input, uint32_t elements) {
-    H3GPU *gpu = GPU(opaque);
-    if (!h3_gpu_require_elements(gpu, input, elements, @"cast input") ||
-        TENSOR(input).dtype != H3_GPU_BF16 ||
-        !h3_gpu_require_elements(gpu, output, elements, @"cast output") ||
-        TENSOR(output).dtype != H3_GPU_F32) return 0;
-    return h3_gpu_dispatch_1d(gpu, @"h3_cast_bf16_to_f32", elements,
+        !h3_gpu_require_elements(gpu, output, elements, @"cast output")) return 0;
+    NSString *dtypes[] = { @"f32", @"bf16", @"i8", @"i32", @"f16" };
+    NSString *name = [NSString stringWithFormat:@"h3_cast_%@_to_%@",
+                               dtypes[t_in.dtype],
+                               dtypes[t_out.dtype]];
+    return h3_gpu_dispatch_1d(gpu, name, elements,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
@@ -1445,7 +1419,7 @@ int h3_gpu_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
         });
 }
 
-static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
+static inline H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
                                  uint32_t sequence,
                                  uint32_t heads, uint32_t head_dim, float scale,
                                  MPSDataType dataType, int causal,
@@ -1519,7 +1493,7 @@ static H3SDPA *h3_gpu_sdpa_graph(H3GPU *gpu, uint32_t batch,
     }
 }
 
-static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
+static inline int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                        const h3_gpu_tensor *value, uint32_t batch,
                        uint32_t sequence,
@@ -1560,8 +1534,11 @@ static int h3_gpu_sdpa(h3_gpu *opaque, h3_gpu_tensor *output,
             output, cache.outputShape, mps_dtype, 0);
         NSDictionary *results = @{cache.output: outputData};
         @try {
+            compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
+            MPSGraphExecutionDescriptor *executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
+            executionDescriptor.compilationDescriptor = compilationDescriptor;
             [cache.graph encodeToCommandBuffer:command feeds:feeds targetOperations:nil
-                             resultsDictionary:results executionDescriptor:nil];
+                             resultsDictionary:results executionDescriptor:executionDescriptor];
         } @catch (NSException *exception) {
             h3_gpu_set_error(gpu, @"MPSGraph SDPA failed: %@", exception.reason);
             return 0;
@@ -2602,11 +2579,9 @@ int h3_gpu_mlp_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     H3GPU *gpu = GPU(opaque);
     if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
                              @"MLP input") ||
-        !h3_gpu_require_bf16(gpu, fc1_weight,
-                             (size_t)hidden_dim * 2 * input_dim,
+        !h3_gpu_require_bf16(gpu, fc1_weight, (size_t)hidden_dim * 2 * input_dim,
                              @"MLP fc1 weight") ||
-        !h3_gpu_require_bf16(gpu, fc2_weight,
-                             (size_t)output_dim * hidden_dim,
+        !h3_gpu_require_bf16(gpu, fc2_weight, (size_t)output_dim * hidden_dim,
                              @"MLP fc2 weight") ||
         !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
                              @"MLP output") ||
@@ -4709,3 +4684,669 @@ int h3_gpu_silu_mul_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
         });
 }
+
+int h3_gpu_zero(h3_gpu *opaque, h3_gpu_tensor *inout, size_t elements, size_t item_size) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || elements > SIZE_MAX / item_size) return 0;
+    size_t bytes = elements * item_size;
+    memset(TENSOR(inout).buffer.contents, 0, bytes);
+    return 1;
+}
+
+h3_gpu_tensor *h3_gpu_tensor_from_f32_nocopy(h3_gpu *opaque, const void *values, size_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    size_t item_size = sizeof(float);
+    if (!gpu || !values || elements > SIZE_MAX / item_size) return NULL;
+    size_t bytes = elements * item_size;
+    H3Tensor *tensor = [[H3Tensor alloc] init];
+    tensor.elements = elements;
+    tensor.bytes = bytes;
+    tensor.dtype = H3_GPU_F32;
+    tensor.buffer = [gpu.device newBufferWithBytesNoCopy:(void *)values
+                                                  length:MAX(bytes, (size_t)1)
+                                                 options:MTLResourceStorageModeShared
+                                             deallocator:nil];
+    if (!tensor.buffer) {
+        h3_gpu_set_error(gpu, @"cannot wrap %zu-byte pointer in no-copy Metal buffer", bytes);
+        return NULL;
+    }
+    tensor.owner = gpu;
+    h3_gpu_stats stats = gpu.stats;
+    stats.allocated_bytes += bytes;
+    stats.live_bytes += bytes;
+    if (stats.live_bytes > stats.peak_live_bytes)
+        stats.peak_live_bytes = stats.live_bytes;
+    stats.tensor_allocations++;
+    gpu.stats = stats;
+    return (__bridge_retained h3_gpu_tensor *)tensor;
+}
+
+static int h3_gpu_require_f16(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                              size_t elements, NSString *label) {
+    if (!h3_gpu_require_elements(gpu, tensor, elements, label)) return 0;
+    if (TENSOR(tensor).dtype != H3_GPU_F16) {
+        h3_gpu_set_error(gpu, @"%@ tensor is not F16", label);
+        return 0;
+    }
+    return 1;
+}
+
+int h3_gpu_cast_bf16_to_f16_inplace(h3_gpu *opaque, h3_gpu_tensor *inout, uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, inout, elements, @"cast inplace") ||
+        TENSOR(inout).dtype != H3_GPU_BF16) return 0;
+    TENSOR(inout).dtype = H3_GPU_F16;
+    return h3_gpu_dispatch_1d(gpu, @"h3_cast_bf16_to_f16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(inout).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(inout).buffer offset:0 atIndex:1];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
+        });
+}
+
+static H3Linear *h3_gpu_linear_f16_input_bf16_graph(H3GPU *gpu, uint32_t rows,
+                                         uint32_t input_dim, uint32_t output_dim,
+                                         int has_bias) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%d:%u", rows,
+                         input_dim, output_dim, has_bias, (unsigned)MPSDataTypeFloat16];
+        H3Linear *cached = gpu.linearCache[key];
+        if (cached) return cached;
+
+        H3Linear *linear = [[H3Linear alloc] init];
+        linear.graph = [[MPSGraph alloc] init];
+        linear.inputShape = @[@1, @(rows), @(input_dim)];
+        linear.weightShape = @[@1, @(output_dim), @(input_dim)];
+        linear.biasShape = @[@1, @1, @(output_dim)];
+        linear.outputShape = @[@1, @(rows), @(output_dim)];
+        linear.input = [linear.graph placeholderWithShape:linear.inputShape
+                                                 dataType:MPSDataTypeBFloat16 name:nil];
+        linear.weight = [linear.graph placeholderWithShape:linear.weightShape
+                                                  dataType:MPSDataTypeFloat16 name:nil];
+
+        MPSGraphTensor *input = [linear.graph castTensor:linear.input toType:MPSDataTypeFloat16 name:nil];
+        MPSGraphTensor *transposed =
+            [linear.graph transposeTensor:linear.weight dimension:1
+                            withDimension:2 name:nil];
+        MPSGraphTensor *output =
+            [linear.graph matrixMultiplicationWithPrimaryTensor:input
+                                                secondaryTensor:transposed name:nil];
+        if (has_bias) {
+            linear.bias = [linear.graph placeholderWithShape:linear.biasShape
+                                                    dataType:MPSDataTypeFloat16 name:nil];
+            output = [linear.graph additionWithPrimaryTensor:output
+                                             secondaryTensor:linear.bias name:nil];
+        }
+
+        linear.output = [linear.graph castTensor:output toType:MPSDataTypeFloat16 name:nil];
+        gpu.linearCache[key] = linear;
+        return linear;
+    }
+}
+
+static inline int h3_gpu_linear_f16_input_bf16_mps(H3GPU *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3Linear *linear = h3_gpu_linear_f16_input_bf16_graph(gpu, rows, input_dim, output_dim,
+                                           bias != NULL);
+    if (!linear) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, linear.inputShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *weight_data = h3_gpu_graph_data(
+            weight, linear.weightShape, MPSDataTypeFloat16, 1);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, linear.outputShape, MPSDataTypeFloat16, 0);
+        NSMutableDictionary *feeds = [@{linear.input: input_data,
+                                         linear.weight: weight_data} mutableCopy];
+        if (bias) {
+            MPSGraphTensorData *bias_data = h3_gpu_graph_data(
+                bias, linear.biasShape, MPSDataTypeFloat16, 1);
+            feeds[linear.bias] = bias_data;
+        }
+        NSDictionary *results = @{linear.output: output_data};
+        @try {
+            [linear.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph linear failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_linear_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+static inline int h3_gpu_linear_f16_input_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *weight,
+                         const h3_gpu_tensor *bias, uint32_t rows,
+                         uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!h3_gpu_require_bf16(gpu, input, input_count, @"linear input") ||
+        !h3_gpu_require_f16(gpu, weight, weight_count, @"linear weight") ||
+        !h3_gpu_require_f16(gpu, output, output_count, @"linear output") ||
+        (bias && !h3_gpu_require_f16(gpu, bias, output_dim, @"linear bias"))) return 0;
+    if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
+        h3_gpu_linear_f16_input_bf16_mps(gpu, output, input, weight, bias, rows,
+                          input_dim, output_dim)) return 1;
+    // NOTE: Shader below is seemingly unused in practice
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    if (!h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu,
+                                                           @"h3_linear_f16_input_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch the 16x16 F16 linear tile");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 15) / 16,
+                                                  (rows + 15) / 16, 1)
+                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+static inline int h3_gpu_qkv_rope_f16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
+                                       h3_gpu_tensor *key,
+                                       h3_gpu_tensor *value,
+                                       const h3_gpu_tensor *qkv,
+                                       const h3_gpu_tensor *q_norm,
+                                       const h3_gpu_tensor *k_norm,
+                                       const h3_gpu_tensor *rope_cos,
+                                       const h3_gpu_tensor *rope_sin,
+                                       uint32_t sequence, uint32_t heads,
+                                       uint32_t head_dim, uint32_t rope_half,
+                                       uint32_t grouped, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t inner = (size_t)heads * head_dim;
+    size_t count = (size_t)sequence * inner;
+    size_t rope_count = (size_t)sequence * rope_half;
+    if (!h3_gpu_require_f16(gpu, qkv, count * 3, @"QKV input") ||
+        !h3_gpu_require_f16(gpu, q_norm, head_dim, @"Q norm") ||
+        !h3_gpu_require_f16(gpu, k_norm, head_dim, @"K norm") ||
+        !h3_gpu_require_f16(gpu, rope_cos, rope_count, @"RoPE cosine") ||
+        !h3_gpu_require_f16(gpu, rope_sin, rope_count, @"RoPE sine") ||
+        !h3_gpu_require_f16(gpu, query, count, @"query") ||
+        !h3_gpu_require_f16(gpu, key, count, @"key") ||
+        !h3_gpu_require_f16(gpu, value, count, @"value") ||
+        rope_half * 2 > head_dim) return 0;
+    qkv_args args = {sequence, heads, head_dim, rope_half, grouped, epsilon};
+    if (head_dim == 128 && !(heads % 4) &&
+        !getenv("H3_DISABLE_COOP_QKV")) {
+        if (!h3_gpu_require_command(gpu)) return 0;
+        NSString *pipeline_name = getenv("H3_DISABLE_CACHED_QKV") ?
+            @"h3_qkv_rope_f16_coop_uncached" :
+            @"h3_qkv_rope_f16_coop";
+        id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+            gpu, pipeline_name);
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < head_dim) {
+            h3_gpu_set_error(gpu,
+                @"cooperative QKV/RoPE needs a 128-thread threadgroup");
+            return 0;
+        }
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> encoder =
+                [gpu.command computeCommandEncoder];
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:TENSOR(qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:6];
+            [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:7];
+            [encoder setBytes:&args length:sizeof(args) atIndex:8];
+            [encoder dispatchThreadgroups:MTLSizeMake(heads / 4, sequence, 1)
+                     threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+            [encoder endEncoding];
+        }
+        h3_gpu_stats stats = gpu.stats;
+        stats.direct_dispatches++;
+        gpu.stats = stats;
+        return 1;
+    }
+    // NOTE: Shader below is seemingly unused in practice
+    return h3_gpu_dispatch_3d(gpu, @"h3_qkv_rope_f16",
+        MTLSizeMake(head_dim, heads, sequence),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(q_norm).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(k_norm).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(rope_cos).buffer offset:0 atIndex:3];
+            [encoder setBuffer:TENSOR(rope_sin).buffer offset:0 atIndex:4];
+            [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:5];
+            [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:6];
+            [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:7];
+            [encoder setBytes:&args length:sizeof(args) atIndex:8];
+        });
+}
+
+int h3_gpu_grouped_qkv_linear_rope_f16(
+                                 h3_gpu *opaque,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *qkv,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    gpu.headMajorSDPAInputs = NO;
+    uint32_t inner = heads * head_dim;
+    return h3_gpu_linear_f16_input_bf16(opaque, qkv, input, weight, NULL, rows,
+                                  input_dim, inner * 3) &&
+            h3_gpu_qkv_rope_f16_layout(
+                opaque, query, key, value, qkv, q_norm, k_norm, rope_cos,
+                rope_sin, rows, heads, head_dim, rope_half, 1, epsilon);
+}
+
+int h3_gpu_sdpa_f16(h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
+                       head_dim, scale, H3_GPU_F16, MPSDataTypeFloat16, 0,
+                       0);
+}
+
+static inline H3Linear *h3_gpu_linear_f16_scale_64_graph(H3GPU *gpu, uint32_t rows,
+                                            uint32_t input_dim, uint32_t output_dim,
+                                            int has_bias) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"f16:%u:%u:%u:%d:%u", rows,
+                         input_dim, output_dim, has_bias, (unsigned)MPSDataTypeFloat16];
+        H3Linear *cached = gpu.linearCache[key];
+        if (cached) return cached;
+
+        H3Linear *linear = [[H3Linear alloc] init];
+        linear.graph = [[MPSGraph alloc] init];
+        linear.inputShape = @[@1, @(rows), @(input_dim)];
+        linear.weightShape = @[@1, @(output_dim), @(input_dim)];
+        linear.biasShape = @[@1, @1, @(output_dim)];
+        linear.outputShape = @[@1, @(rows), @(output_dim)];
+        linear.input = [linear.graph placeholderWithShape:linear.inputShape
+                                                 dataType:MPSDataTypeFloat16 name:nil];
+        linear.weight = [linear.graph placeholderWithShape:linear.weightShape
+                                                  dataType:MPSDataTypeFloat16 name:nil];
+        MPSGraphTensor *scale_f16 = [linear.graph constantWithScalar:64.0 dataType:MPSDataTypeFloat16];
+        MPSGraphTensor *input =
+            [linear.graph divisionWithPrimaryTensor:linear.input
+                                 secondaryTensor:scale_f16 name:nil];
+
+        MPSGraphTensor *transposed =
+            [linear.graph transposeTensor:linear.weight dimension:1
+                            withDimension:2 name:nil];
+        MPSGraphTensor *output =
+            [linear.graph matrixMultiplicationWithPrimaryTensor:input
+                                                secondaryTensor:transposed name:nil];
+
+        MPSGraphTensor *scale_f32 = [linear.graph constantWithScalar:64.0 dataType:MPSDataTypeFloat32];
+        MPSGraphTensor *output_f32 = [linear.graph castTensor:output toType:MPSDataTypeFloat32 name:nil];
+        output =
+            [linear.graph multiplicationWithPrimaryTensor:output_f32
+                                       secondaryTensor:scale_f32 name:nil];
+
+        if (has_bias) {
+            linear.bias = [linear.graph placeholderWithShape:linear.biasShape
+                                                    dataType:MPSDataTypeFloat16 name:nil];
+            MPSGraphTensor *bias = [linear.graph castTensor:linear.bias toType:MPSDataTypeFloat32 name:nil];
+            output = [linear.graph additionWithPrimaryTensor:output
+                                            secondaryTensor:bias name:nil];
+        }
+
+        linear.output = [linear.graph castTensor:output toType:MPSDataTypeBFloat16 name:nil];
+        gpu.linearCache[key] = linear;
+        return linear;
+    }
+}
+
+static inline int h3_gpu_linear_f16_scale_64_mps(H3GPU *gpu, h3_gpu_tensor *output,
+                             const h3_gpu_tensor *input,
+                             const h3_gpu_tensor *weight,
+                             const h3_gpu_tensor *bias, uint32_t rows,
+                             uint32_t input_dim, uint32_t output_dim) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3Linear *linear = h3_gpu_linear_f16_scale_64_graph(gpu, rows, input_dim, output_dim,
+                                           bias != NULL);
+    if (!linear) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *input_data = h3_gpu_graph_data(
+            input, linear.inputShape, MPSDataTypeFloat16, 0);
+        MPSGraphTensorData *weight_data = h3_gpu_graph_data(
+            weight, linear.weightShape, MPSDataTypeFloat16, 1);
+        MPSGraphTensorData *output_data = h3_gpu_graph_data(
+            output, linear.outputShape, MPSDataTypeBFloat16, 0);
+        NSMutableDictionary *feeds = [@{linear.input: input_data,
+                                         linear.weight: weight_data} mutableCopy];
+        if (bias) {
+            MPSGraphTensorData *bias_data = h3_gpu_graph_data(
+                bias, linear.biasShape, MPSDataTypeFloat16, 1);
+            feeds[linear.bias] = bias_data;
+        }
+        NSDictionary *results = @{linear.output: output_data};
+        @try {
+            // Bypass ANE by setting device to GPU/performance.
+            MPSGraphCompilationDescriptor *compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
+            compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
+            //compilationDescriptor.optimizationProfile = MPSGraphOptimizationProfilePerformance;
+            MPSGraphExecutionDescriptor *executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
+            executionDescriptor.compilationDescriptor = compilationDescriptor;
+            [linear.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:executionDescriptor];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph linear failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_linear_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_linear_f16_scale_64(h3_gpu *opaque, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *weight,
+                         const h3_gpu_tensor *bias, uint32_t rows,
+                         uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!h3_gpu_require_f16(gpu, input, input_count, @"linear input") ||
+        !h3_gpu_require_f16(gpu, weight, weight_count, @"linear weight") ||
+        !h3_gpu_require_bf16(gpu, output, output_count, @"linear output") ||
+        (bias && !h3_gpu_require_f16(gpu, bias, output_dim, @"linear bias"))) return 0;
+    if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
+        h3_gpu_linear_f16_scale_64_mps(gpu, output, input, weight, bias, rows,
+                          input_dim, output_dim)) return 1;
+    printf("\nh3_linear_f16_scale_64\n");
+    fflush(stdout);
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    if (!h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu,
+                                                           @"h3_linear_f16_scale_64");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch the 16x16 F16 linear tile");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 15) / 16,
+                                                  (rows + 15) / 16, 1)
+                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+static inline H3MLP *h3_gpu_mlp_graph_f16_scale_256(H3GPU *gpu, uint32_t rows,
+                                       uint32_t input_dim, uint32_t hidden_dim,
+                                       uint32_t output_dim) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"f16:%u:%u:%u:%u", rows,
+                         input_dim, hidden_dim, output_dim];
+        H3MLP *cached = gpu.mlpCache[key];
+        if (cached) return cached;
+
+        H3MLP *mlp = [[H3MLP alloc] init];
+        mlp.graph = [[MPSGraph alloc] init];
+        mlp.inputShape = @[@1, @(rows), @(input_dim)];
+        mlp.fc1Shape = @[@1, @(hidden_dim * 2), @(input_dim)];
+        mlp.fc2Shape = @[@1, @(output_dim), @(hidden_dim)];
+        mlp.outputShape = @[@1, @(rows), @(output_dim)];
+        mlp.input = [mlp.graph placeholderWithShape:mlp.inputShape
+                                           dataType:MPSDataTypeBFloat16 name:nil];
+        mlp.fc1Weight = [mlp.graph placeholderWithShape:mlp.fc1Shape
+                                               dataType:MPSDataTypeFloat16 name:nil];
+        mlp.fc2Weight = [mlp.graph placeholderWithShape:mlp.fc2Shape
+                                               dataType:MPSDataTypeFloat16 name:nil];
+        MPSGraphTensor *fc1Transposed =
+            [mlp.graph transposeTensor:mlp.fc1Weight dimension:1
+                         withDimension:2 name:nil];
+        MPSGraphTensor *input = [mlp.graph castTensor:mlp.input toType:MPSDataTypeFloat16 name:nil];
+        MPSGraphTensor *fused =
+            [mlp.graph matrixMultiplicationWithPrimaryTensor:input
+                                             secondaryTensor:fc1Transposed name:nil];
+        NSArray<MPSGraphTensor *> *halves =
+            [mlp.graph splitTensor:fused numSplits:2 axis:2 name:nil];
+        MPSGraphTensor *gate = [mlp.graph castTensor:halves[0] toType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *up = [mlp.graph castTensor:halves[1] toType:MPSDataTypeFloat32 name:nil];
+
+        MPSGraphTensor *sigmoid = [mlp.graph sigmoidWithTensor:gate name:nil];
+        MPSGraphTensor *silu =
+            [mlp.graph multiplicationWithPrimaryTensor:gate
+                                       secondaryTensor:sigmoid name:nil];
+        MPSGraphTensor *activated =
+            [mlp.graph multiplicationWithPrimaryTensor:silu
+                                       secondaryTensor:up name:nil];
+
+        MPSGraphTensor *scale = [mlp.graph constantWithScalar:256.0 dataType:MPSDataTypeFloat32];
+        MPSGraphTensor *activated_scaled =
+            [mlp.graph divisionWithPrimaryTensor:activated
+                                 secondaryTensor:scale name:nil];
+        MPSGraphTensor *activated_scaled_f16 = [mlp.graph castTensor:activated_scaled toType:MPSDataTypeFloat16 name:nil];
+
+        MPSGraphTensor *fc2Transposed =
+            [mlp.graph transposeTensor:mlp.fc2Weight dimension:1
+                         withDimension:2 name:nil];
+        MPSGraphTensor *result =
+            [mlp.graph matrixMultiplicationWithPrimaryTensor:activated_scaled_f16
+                                             secondaryTensor:fc2Transposed name:nil];
+
+        MPSGraphTensor *result_f32 = [mlp.graph castTensor:result toType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *result_scaled =
+            [mlp.graph multiplicationWithPrimaryTensor:result_f32
+                                       secondaryTensor:scale name:nil];
+
+        mlp.output = [mlp.graph castTensor:result_scaled toType:MPSDataTypeBFloat16 name:nil];
+        gpu.mlpCache[key] = mlp;
+        return mlp;
+    }
+}
+
+int h3_gpu_mlp_f16_scale_256(h3_gpu *opaque, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *fc1_weight,
+                       const h3_gpu_tensor *fc2_weight, uint32_t rows,
+                       uint32_t input_dim, uint32_t hidden_dim,
+                       uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                            @"MLP input") ||
+        !h3_gpu_require_f16(gpu, fc1_weight, (size_t)hidden_dim * 2 * input_dim,
+                            @"MLP fc1 weight") ||
+        !h3_gpu_require_f16(gpu, fc2_weight, (size_t)output_dim * hidden_dim,
+                            @"MLP fc2 weight") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                            @"MLP output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    H3MLP *mlp = h3_gpu_mlp_graph_f16_scale_256(gpu, rows, input_dim, hidden_dim,
+                                  output_dim);
+    if (!mlp) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *inputData = h3_gpu_graph_data(
+            input, mlp.inputShape, MPSDataTypeBFloat16, 0);
+        MPSGraphTensorData *fc1Data = h3_gpu_graph_data(
+            fc1_weight, mlp.fc1Shape, MPSDataTypeFloat16, 1);
+        MPSGraphTensorData *fc2Data = h3_gpu_graph_data(
+            fc2_weight, mlp.fc2Shape, MPSDataTypeFloat16, 1);
+        MPSGraphTensorData *outputData = h3_gpu_graph_data(
+            output, mlp.outputShape, MPSDataTypeBFloat16, 0);
+        NSDictionary *feeds = @{mlp.input: inputData,
+                                mlp.fc1Weight: fc1Data,
+                                mlp.fc2Weight: fc2Data};
+        NSDictionary *results = @{mlp.output: outputData};
+        @try {
+            // Bypass ANE by setting device to GPU/performance.
+            MPSGraphCompilationDescriptor *compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
+            compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
+            //compilationDescriptor.optimizationProfile = MPSGraphOptimizationProfilePerformance;
+            MPSGraphExecutionDescriptor *executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
+            executionDescriptor.compilationDescriptor = compilationDescriptor;
+            [mlp.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:executionDescriptor];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph MLP failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_linear_dispatches += 2;
+    gpu.stats = stats;
+    return 1;
+}
+
+static inline H3Linear *h3_gpu_lora_graph(H3GPU *gpu,
+                                    uint32_t output_dim, uint32_t rank, uint32_t input_dim,
+                                    MPSDataType dataType) {
+    @autoreleasepool {
+        NSString *key = [NSString stringWithFormat:@"lora:%u:%u:%u:%u", output_dim,
+                         rank, input_dim, (unsigned)dataType];
+        H3Linear *cached = gpu.linearCache[key];
+        if (cached) return cached;
+
+        H3Linear *lora = [[H3Linear alloc] init];
+        lora.graph = [[MPSGraph alloc] init];
+        lora.inputShape = @[@1, @(output_dim), @(rank)];
+        lora.weightShape = @[@1, @(rank), @(input_dim)];
+        lora.outputShape = @[@1, @(output_dim), @(input_dim)];
+        lora.input = [lora.graph placeholderWithShape:lora.inputShape
+                                                dataType:dataType name:nil];
+        lora.weight = [lora.graph placeholderWithShape:lora.weightShape
+                                                dataType:dataType name:nil];
+        MPSGraphTensor *output =
+            [lora.graph matrixMultiplicationWithPrimaryTensor:lora.input
+                                                secondaryTensor:lora.weight name:nil];
+        lora.bias = [lora.graph placeholderWithShape:lora.outputShape
+                                                dataType:dataType name:nil];
+        output = [lora.graph additionWithPrimaryTensor:output
+                                                secondaryTensor:lora.bias name:nil];
+        lora.output = [lora.graph castTensor:output toType:dataType name:nil];
+        gpu.linearCache[key] = lora;
+        return lora;
+    }
+}
+
+static int h3_gpu_lora_mps(H3GPU *gpu, h3_gpu_tensor *inout,
+                             const h3_gpu_tensor *lora_b,
+                             const h3_gpu_tensor *lora_a,
+                             uint32_t output_dim, uint32_t rank, uint32_t input_dim,
+                             MPSDataType dataType) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    H3Linear *lora = h3_gpu_lora_graph(gpu, output_dim, rank, input_dim, dataType);
+    if (!lora) return 0;
+    @autoreleasepool {
+        MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
+        MPSGraphTensorData *lora_b_data = h3_gpu_graph_data(
+            lora_b, lora.inputShape, dataType, 1);
+        MPSGraphTensorData *lora_a_data = h3_gpu_graph_data(
+            lora_a, lora.weightShape, dataType, 1);
+        MPSGraphTensorData *inout_data = h3_gpu_graph_data(
+            inout, lora.outputShape, dataType, 0);
+        NSMutableDictionary *feeds = [@{lora.input: lora_b_data,
+                                        lora.weight: lora_a_data,
+                                        lora.bias: inout_data
+                                        } mutableCopy];
+        NSDictionary *results = @{lora.output: inout_data};
+        @try {
+            // Bypass ANE by setting device to GPU/performance.
+            MPSGraphCompilationDescriptor *compilationDescriptor = [[MPSGraphCompilationDescriptor alloc] init];
+            compilationDescriptor.optimizationLevel = MPSGraphOptimizationLevel0;
+            //compilationDescriptor.optimizationProfile = MPSGraphOptimizationProfilePerformance;
+            MPSGraphExecutionDescriptor *executionDescriptor = [[MPSGraphExecutionDescriptor alloc] init];
+            executionDescriptor.compilationDescriptor = compilationDescriptor;
+            [lora.graph encodeToCommandBuffer:command feeds:feeds
+                targetOperations:nil resultsDictionary:results
+                executionDescriptor:executionDescriptor];
+        } @catch (NSException *exception) {
+            h3_gpu_set_error(gpu, @"MPSGraph lora failed: %@", exception.reason);
+            return 0;
+        }
+        gpu.command = command.rootCommandBuffer;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.mps_linear_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_lora_bf16(h3_gpu *opaque, h3_gpu_tensor *inout,
+                       const h3_gpu_tensor *lora_b,
+                       const h3_gpu_tensor *lora_a,
+                       uint32_t output_dim, uint32_t rank, uint32_t input_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t lora_b_count = (size_t)output_dim * rank;
+    size_t lora_a_count = (size_t)rank * input_dim;
+    size_t tensor_count = (size_t)output_dim * input_dim;
+    if (!h3_gpu_require_bf16(gpu, lora_b, lora_b_count, @"lora b") ||
+        !h3_gpu_require_bf16(gpu, lora_a, lora_a_count, @"lora a") ||
+        !h3_gpu_require_bf16(gpu, inout, tensor_count, @"lora tensor")) return 0;
+    return h3_gpu_lora_mps(gpu, inout, lora_b, lora_a,
+                            output_dim, rank, input_dim,
+                            MPSDataTypeBFloat16);
+}
+
+int h3_gpu_lora_f16(h3_gpu *opaque, h3_gpu_tensor *inout,
+                       const h3_gpu_tensor *lora_b,
+                       const h3_gpu_tensor *lora_a,
+                       uint32_t output_dim, uint32_t rank, uint32_t input_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t lora_b_count = (size_t)output_dim * rank;
+    size_t lora_a_count = (size_t)rank * input_dim;
+    size_t tensor_count = (size_t)output_dim * input_dim;
+    if (!h3_gpu_require_f16(gpu, lora_b, lora_b_count, @"lora b") ||
+        !h3_gpu_require_f16(gpu, lora_a, lora_a_count, @"lora a") ||
+        !h3_gpu_require_f16(gpu, inout, tensor_count, @"lora tensor")) return 0;
+    return h3_gpu_lora_mps(gpu, inout, lora_b, lora_a,
+                            output_dim, rank, input_dim,
+                            MPSDataTypeFloat16);
+}
+

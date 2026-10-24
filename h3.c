@@ -1595,6 +1595,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_dynamic_fc1_k,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
+            params->use_f16_dit,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
@@ -1616,6 +1617,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_dynamic_fc1_k,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
+            params->use_f16_dit,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {
@@ -1633,7 +1635,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             fprintf(stderr, "h3: prepared DiT cache miss; model retained\n");
         }
     }
-    h3_text_embedding_free(&text);
     free(condition_video_rows);
     condition_video_rows = NULL;
     free(condition_audio_rows);

@@ -201,7 +201,7 @@ static int load_normalized_conv(audio_context *audio, audio_conv *conv,
     conv->magnitude = f3(audio, name, outer, 1, 1, error, error_size);
     if (!conv->magnitude) return 0;
     size_t elements = (size_t)outer * inner_channels * kernel;
-    conv->weight = h3_gpu_tensor_new_f32(audio->gpu, elements);
+    conv->weight = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
     if (!conv->weight) {
         fail(error, error_size, "cannot allocate normalized %s weight: %s",
              prefix, h3_gpu_error(audio->gpu));
@@ -366,7 +366,7 @@ static int prepare_input(audio_context *audio, const float *input,
                 rows[destination++] = input[source] * deviation[channel] +
                                       mean[channel];
             }
-    h3_gpu_tensor *latent = h3_gpu_tensor_from_f32(audio->gpu, rows, elements);
+    h3_gpu_tensor *latent = h3_gpu_tensor_load(audio->gpu, rows, elements, H3_GPU_F32);
     free(rows);
     if (!latent) {
         fail(error, error_size, "cannot allocate audio latent: %s",
@@ -383,10 +383,10 @@ static int prepare_input(audio_context *audio, const float *input,
                                   LATENT_DIM, DECODER_DIM, 7, 3, 1, 1, 0, 1,
                                   error, error_size);
     if (!ok) goto done;
-    projected = h3_gpu_tensor_new_f32(
-        audio->gpu, (size_t)STEREO * audio->length * LATENT_DIM);
-    hidden = h3_gpu_tensor_new_f32(
-        audio->gpu, (size_t)STEREO * audio->length * DECODER_DIM);
+    projected = h3_gpu_tensor_new(
+        audio->gpu, (size_t)STEREO * audio->length * LATENT_DIM, H3_GPU_F32);
+    hidden = h3_gpu_tensor_new(
+        audio->gpu, (size_t)STEREO * audio->length * DECODER_DIM, H3_GPU_F32);
     if (!projected || !hidden) {
         fail(error, error_size, "cannot allocate AudioVAE input activations: %s",
              h3_gpu_error(audio->gpu));
@@ -536,11 +536,11 @@ static int run_stage(audio_context *audio, audio_stage *stage, int index,
         return 0;
     }
     size_t elements = (size_t)elements64;
-    h3_gpu_tensor *upsampled = h3_gpu_tensor_new_f32(audio->gpu, elements);
-    h3_gpu_tensor *sum = h3_gpu_tensor_new_f32(audio->gpu, elements);
-    h3_gpu_tensor *work = h3_gpu_tensor_new_f32(audio->gpu, elements);
-    h3_gpu_tensor *activated = h3_gpu_tensor_new_f32(audio->gpu, elements);
-    h3_gpu_tensor *branch = h3_gpu_tensor_new_f32(audio->gpu, elements);
+    h3_gpu_tensor *upsampled = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
+    h3_gpu_tensor *sum = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
+    h3_gpu_tensor *work = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
+    h3_gpu_tensor *activated = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
+    h3_gpu_tensor *branch = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
     int ok = upsampled && sum && work && activated && branch;
     if (!ok) {
         fail(error, error_size, "cannot allocate AudioVAE stage activations: %s",
@@ -614,8 +614,8 @@ static int decode_output(audio_context *audio, h3_audio_waveform *output,
              load_normalized_conv(audio, &post, "decoder.conv_post", 8, 1, 7,
                                   3, 1, 1, 0, 0, error, error_size);
     if (!ok) goto done;
-    activated = h3_gpu_tensor_new_f32(audio->gpu, hidden_elements);
-    waveform = h3_gpu_tensor_new_f32(audio->gpu, waveform_elements);
+    activated = h3_gpu_tensor_new(audio->gpu, hidden_elements, H3_GPU_F32);
+    waveform = h3_gpu_tensor_new(audio->gpu, waveform_elements, H3_GPU_F32);
     if (!activated || !waveform || waveform_elements > UINT32_MAX) {
         fail(error, error_size, "cannot allocate AudioVAE output: %s",
              h3_gpu_error(audio->gpu));
@@ -775,12 +775,12 @@ static int encoder_initial(audio_context *audio, const float *pcm, int samples,
         memcpy(input_rows + (size_t)channel * padded,
                pcm + (size_t)channel * (size_t)samples,
                (size_t)samples * sizeof(*pcm));
-    h3_gpu_tensor *input = h3_gpu_tensor_from_f32(
-        audio->gpu, input_rows, input_elements);
+    h3_gpu_tensor *input = h3_gpu_tensor_load(
+        audio->gpu, input_rows, input_elements, H3_GPU_F32);
     free(input_rows);
     audio_conv conv = {0};
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_f32(
-        audio->gpu, (size_t)STEREO * padded * ENCODER_DIM);
+    h3_gpu_tensor *hidden = h3_gpu_tensor_new(
+        audio->gpu, (size_t)STEREO * padded * ENCODER_DIM, H3_GPU_F32);
     int ok = input && hidden && load_normalized_conv(
         audio, &conv, "encoder.block.0", 1, ENCODER_DIM, 7, 3, 1, 1, 0, 1,
         error, error_size);
@@ -835,8 +835,8 @@ static int encoder_residual(audio_context *audio, int stage, int residual,
         error, error_size);
     size_t elements = (size_t)STEREO * audio->length * channels;
     if (ok) {
-        activated = h3_gpu_tensor_new_f32(audio->gpu, elements);
-        branch = h3_gpu_tensor_new_f32(audio->gpu, elements);
+        activated = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
+        branch = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
         if (!activated || !branch) {
             fail(error, error_size,
                  "cannot allocate AudioVAE encoder residual activations: %s",
@@ -899,8 +899,8 @@ static int encoder_downsample(audio_context *audio, int stage,
     size_t input_elements = (size_t)STEREO * audio->length * channels;
     size_t output_elements = (size_t)STEREO * output_length * channels * 2;
     if (ok) {
-        activated = h3_gpu_tensor_new_f32(audio->gpu, input_elements);
-        down = h3_gpu_tensor_new_f32(audio->gpu, output_elements);
+        activated = h3_gpu_tensor_new(audio->gpu, input_elements, H3_GPU_F32);
+        down = h3_gpu_tensor_new(audio->gpu, output_elements, H3_GPU_F32);
         if (!activated || !down) {
             fail(error, error_size,
                  "cannot allocate AudioVAE encoder downsample: %s",
@@ -948,8 +948,8 @@ static int encoder_final_conv(audio_context *audio, char *error,
         1, 0, 1, error, error_size);
     size_t elements = (size_t)STEREO * audio->length * LATENT_DIM;
     if (ok) {
-        activated = h3_gpu_tensor_new_f32(audio->gpu, elements);
-        hidden = h3_gpu_tensor_new_f32(audio->gpu, elements);
+        activated = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
+        hidden = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
         if (!activated || !hidden) {
             fail(error, error_size,
                  "cannot allocate AudioVAE encoder final activations: %s",
@@ -1020,10 +1020,10 @@ static int encoder_projection_branch(audio_context *audio,
         load_linear(audio, "pre_block.proj", LATENT_DIM, LATENT_CHANNELS,
                     &proj_w, &proj_b, 1, error, error_size);
     if (ok) {
-        normalized = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_DIM);
-        projected = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS);
+        normalized = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_DIM, H3_GPU_F32);
+        projected = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS, H3_GPU_F32);
         if (!normalized || !projected) {
             fail(error, error_size,
                  "cannot allocate AudioVAE projection branch: %s",
@@ -1080,16 +1080,16 @@ static int encoder_attention_branch(audio_context *audio,
         audio, "pre_block.attn.proj", LATENT_CHANNELS, LATENT_CHANNELS,
         &proj_w, &proj_b, 1, error, error_size);
     if (ok) {
-        normalized = h3_gpu_tensor_new_f32(audio->gpu, attention_elements);
-        qkv = h3_gpu_tensor_new_f32(audio->gpu, attention_elements * 3);
-        query = h3_gpu_tensor_new_f32(audio->gpu, attention_elements);
-        key = h3_gpu_tensor_new_f32(audio->gpu, attention_elements);
-        value = h3_gpu_tensor_new_f32(audio->gpu, attention_elements);
-        attended = h3_gpu_tensor_new_f32(audio->gpu, attention_elements);
-        pooled = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS);
-        projected = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS);
+        normalized = h3_gpu_tensor_new(audio->gpu, attention_elements, H3_GPU_F32);
+        qkv = h3_gpu_tensor_new(audio->gpu, attention_elements * 3, H3_GPU_F32);
+        query = h3_gpu_tensor_new(audio->gpu, attention_elements, H3_GPU_F32);
+        key = h3_gpu_tensor_new(audio->gpu, attention_elements, H3_GPU_F32);
+        value = h3_gpu_tensor_new(audio->gpu, attention_elements, H3_GPU_F32);
+        attended = h3_gpu_tensor_new(audio->gpu, attention_elements, H3_GPU_F32);
+        pooled = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS, H3_GPU_F32);
+        projected = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS, H3_GPU_F32);
         if (!normalized || !qkv || !query || !key || !value || !attended ||
             !pooled || !projected) {
             fail(error, error_size,
@@ -1163,18 +1163,18 @@ static int encoder_mlp(audio_context *audio, h3_gpu_tensor *base,
         load_linear(audio, "pre_block.mlp.w2", LATENT_CHANNELS * 2,
                     LATENT_CHANNELS, &w2, &b2, 1, error, error_size);
     if (ok) {
-        norm2 = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS);
-        normm = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS);
-        gate = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS * 2);
-        linear = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS * 2);
-        geglu = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS * 2);
-        branch = h3_gpu_tensor_new_f32(
-            audio->gpu, (size_t)rows * LATENT_CHANNELS);
+        norm2 = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS, H3_GPU_F32);
+        normm = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS, H3_GPU_F32);
+        gate = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS * 2, H3_GPU_F32);
+        linear = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS * 2, H3_GPU_F32);
+        geglu = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS * 2, H3_GPU_F32);
+        branch = h3_gpu_tensor_new(
+            audio->gpu, (size_t)rows * LATENT_CHANNELS, H3_GPU_F32);
         if (!norm2 || !normm || !gate || !linear || !geglu || !branch) {
             fail(error, error_size, "cannot allocate AudioVAE MLP: %s",
                  h3_gpu_error(audio->gpu));
@@ -1226,7 +1226,7 @@ static int encoder_output(audio_context *audio, h3_gpu_tensor *base,
                           char *error, size_t error_size) {
     audio_conv conv = {0};
     size_t elements = (size_t)STEREO * audio->length * LATENT_CHANNELS;
-    h3_gpu_tensor *latent = h3_gpu_tensor_new_f32(audio->gpu, elements);
+    h3_gpu_tensor *latent = h3_gpu_tensor_new(audio->gpu, elements, H3_GPU_F32);
     int ok = latent && load_plain_conv(
         audio, &conv, "mean_proj", LATENT_CHANNELS, LATENT_CHANNELS, 1, 0, 1,
         1, error, error_size);

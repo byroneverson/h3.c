@@ -182,7 +182,7 @@ static int layer_weights_load(load_context *load, int layer,
 
 static h3_gpu_tensor *allocate_bf16(load_context *load, size_t elements) {
     h3_gpu_tensor *tensor = defer(
-        load, h3_gpu_tensor_new_bf16(load->gpu, elements));
+        load, h3_gpu_tensor_new(load->gpu, elements, H3_GPU_BF16));
     if (!tensor) {
         fail(load->error, load->error_size,
              "cannot allocate prefetched Qwen weight: %s",
@@ -567,23 +567,23 @@ static int text_encode_bf16_impl(
         }
     }
 
-    h3_gpu_tensor *ids = h3_gpu_tensor_from_u32(gpu, token_ids, token_count);
-    h3_gpu_tensor *rope_cos = h3_gpu_tensor_from_f32(
-        gpu, cosines, token_count * TEXT_ROPE_HALF);
-    h3_gpu_tensor *rope_sin = h3_gpu_tensor_from_f32(
-        gpu, sines, token_count * TEXT_ROPE_HALF);
+    h3_gpu_tensor *ids = h3_gpu_tensor_load(gpu, token_ids, token_count, H3_GPU_U32);
+    h3_gpu_tensor *rope_cos = h3_gpu_tensor_load(
+        gpu, cosines, token_count * TE.rope_half, H3_GPU_F32);
+    h3_gpu_tensor *rope_sin = h3_gpu_tensor_load(
+        gpu, sines, token_count * TE.rope_half, H3_GPU_F32);
     free(cosines);
     free(sines);
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_bf16(gpu, hidden_count);
-    h3_gpu_tensor *norm = h3_gpu_tensor_new_bf16(gpu, hidden_count);
-    h3_gpu_tensor *query = h3_gpu_tensor_new_bf16(gpu, query_count);
-    h3_gpu_tensor *key = h3_gpu_tensor_new_bf16(gpu, kv_count);
-    h3_gpu_tensor *value = h3_gpu_tensor_new_bf16(gpu, kv_count);
-    h3_gpu_tensor *attention_heads = h3_gpu_tensor_new_bf16(gpu, query_count);
-    h3_gpu_tensor *attention_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
-    h3_gpu_tensor *gate = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
-    h3_gpu_tensor *up = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
-    h3_gpu_tensor *mlp_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *hidden = h3_gpu_tensor_new(gpu, hidden_count, H3_GPU_BF16);
+    h3_gpu_tensor *norm = h3_gpu_tensor_new(gpu, hidden_count, H3_GPU_BF16);
+    h3_gpu_tensor *query = h3_gpu_tensor_new(gpu, query_count, H3_GPU_BF16);
+    h3_gpu_tensor *key = h3_gpu_tensor_new(gpu, kv_count, H3_GPU_BF16);
+    h3_gpu_tensor *value = h3_gpu_tensor_new(gpu, kv_count, H3_GPU_BF16);
+    h3_gpu_tensor *attention_heads = h3_gpu_tensor_new(gpu, query_count, H3_GPU_BF16);
+    h3_gpu_tensor *attention_output = h3_gpu_tensor_new(gpu, hidden_count, H3_GPU_BF16);
+    h3_gpu_tensor *gate = h3_gpu_tensor_new(gpu, intermediate_count, H3_GPU_BF16);
+    h3_gpu_tensor *up = h3_gpu_tensor_new(gpu, intermediate_count, H3_GPU_BF16);
+    h3_gpu_tensor *mlp_output = h3_gpu_tensor_new(gpu, hidden_count, H3_GPU_BF16);
     h3_gpu_tensor *deepstack[3] = {NULL, NULL, NULL};
     if (span_count) {
         uint16_t *values = calloc(hidden_count, sizeof(*values));
@@ -599,8 +599,7 @@ static int text_encode_bf16_impl(
                        span->deepstack[layer],
                        span->tokens * TEXT_HIDDEN * sizeof(*values));
             }
-            deepstack[layer] = h3_gpu_tensor_from_bf16(gpu, values,
-                                                        hidden_count);
+            deepstack[layer] = h3_gpu_tensor_load(gpu, values, hidden_count, H3_GPU_BF16);
         }
         free(values);
     }

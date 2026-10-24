@@ -1,6 +1,8 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_safetensors.h"
+#include "h3_text_encoder.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -65,12 +67,16 @@ typedef struct {
 
 typedef struct {
     h3_dit_stream_source sources[STREAM_MATRICES];
+    h3_dit_stream_source lora_a[STREAM_MATRICES];
+    h3_dit_stream_source lora_b[STREAM_MATRICES];
 } h3_dit_stream_layer;
 
 struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
+    // DEBUG LUP
+    h3_lup *lup;
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
@@ -86,6 +92,7 @@ struct h3_dit {
     int use_slower_dynamic_fc1_k;
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
+    int use_f16_dit;
     int ssd_streaming;
     int keep_bf16_mlp;
     int activation_aliases;
@@ -235,28 +242,62 @@ static void free_tensor(h3_gpu_tensor **tensor) {
     *tensor = NULL;
 }
 
-static h3_gpu_tensor *bf1(h3_dit *dit, const char *name, uint64_t width,
+static h3_gpu_tensor *bf16_1(h3_dit *dit, const char *name, uint64_t width,
                           char *error, size_t error_size) {
     uint64_t shape[] = {width};
     return h3_weight_load_bf16(dit->weights, dit->gpu, name, 1, shape,
                                error, error_size);
 }
 
-static h3_gpu_tensor *bf2(h3_dit *dit, const char *name, uint64_t rows,
-                          uint64_t columns, char *error, size_t error_size) {
+static h3_gpu_tensor *bf16_2(h3_dit *dit, const char *name, uint64_t rows, uint64_t columns,
+                          char *error, size_t error_size) {
     uint64_t shape[] = {rows, columns};
     return h3_weight_load_bf16(dit->weights, dit->gpu, name, 2, shape,
                                error, error_size);
 }
 
-static h3_gpu_tensor *f1(h3_dit *dit, const char *name, uint64_t width,
+static h3_gpu_tensor *bf16_2_lora(h3_dit *dit, const char *name, uint64_t rows,
+                          uint64_t columns,
+                          const char *lora_a, const char *lora_b,
+                          char *error, size_t error_size) {
+    uint64_t shape[] = {rows, columns};
+    return h3_weight_load_bf16_lora(dit->weights, dit->gpu, name, 2, shape,
+                                lora_a, lora_b, 64,
+                                error, error_size);
+}
+
+static h3_gpu_tensor *f16_1(h3_dit *dit, const char *name, uint64_t width,
+                         char *error, size_t error_size) {
+    uint64_t shape[] = {width};
+    return h3_weight_load_f16_from_bf16(dit->weights, dit->gpu, name, 1, shape,
+                              error, error_size);
+}
+
+static h3_gpu_tensor *f16_2(h3_dit *dit, const char *name, uint64_t rows,
+                         uint64_t columns, char *error, size_t error_size) {
+    uint64_t shape[] = {rows, columns};
+    return h3_weight_load_f16_from_bf16(dit->weights, dit->gpu, name, 2, shape,
+                              error, error_size);
+}
+
+static h3_gpu_tensor *f16_2_lora(h3_dit *dit, const char *name, uint64_t rows,
+                          uint64_t columns,
+                          const char *lora_a, const char *lora_b,
+                          char *error, size_t error_size) {
+    uint64_t shape[] = {rows, columns};
+    return h3_weight_load_f16_from_bf16_lora(dit->weights, dit->gpu, name, 2, shape,
+                                lora_a, lora_b, 64,
+                                error, error_size);
+}
+
+static h3_gpu_tensor *f32_1(h3_dit *dit, const char *name, uint64_t width,
                          char *error, size_t error_size) {
     uint64_t shape[] = {width};
     return h3_weight_load_f32(dit->weights, dit->gpu, name, 1, shape,
                               error, error_size);
 }
 
-static h3_gpu_tensor *f2(h3_dit *dit, const char *name, uint64_t rows,
+static h3_gpu_tensor *f32_2(h3_dit *dit, const char *name, uint64_t rows,
                          uint64_t columns, char *error, size_t error_size) {
     uint64_t shape[] = {rows, columns};
     return h3_weight_load_f32(dit->weights, dit->gpu, name, 2, shape,
@@ -499,29 +540,123 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
            (local % spatial_width) / 2;
 }
 
+static int load_refiner_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
+                      char *error, size_t error_size) {
+    char name[160];
+    char lora_a[160];
+    char lora_b[160];
+#define LOAD1_BF16(field, suffix, width) do {                                       \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
+    block->field = bf16_1(dit, name, width, error, error_size);                    \
+    if (!block->field) return 0;                                                \
+} while (0)
+#define LOAD2_BF16(field, suffix, rows, columns, suffix_a, suffix_b) do {                           \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                                           \
+    if (suffix_a && suffix_a) {                                                                     \
+        snprintf(lora_a, sizeof(lora_a), "%s%s", prefix, suffix_a);                                 \
+        snprintf(lora_b, sizeof(lora_b), "%s%s", prefix, suffix_b);                                 \
+        block->field = bf16_2_lora(dit, name, rows, columns, lora_a, lora_b, error, error_size);    \
+    } else {                                                                                        \
+        block->field = bf16_2(dit, name, rows, columns, error, error_size);                         \
+    }                                                                                               \
+    if (!block->field) return 0;                                                                    \
+} while (0)
+#define LOAD1_F16(field, suffix, width) do {                                                        \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                                           \
+    block->field = f16_1(dit, name, width, error, error_size);                                      \
+    if (!block->field) return 0;                                                                    \
+} while (0)
+#define LOAD2_F16(field, suffix, rows, columns, suffix_a, suffix_b) do {                            \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                                           \
+    if (suffix_a && suffix_a) {                                                                     \
+        snprintf(lora_a, sizeof(lora_a), "%s%s", prefix, suffix_a);                                 \
+        snprintf(lora_b, sizeof(lora_b), "%s%s", prefix, suffix_b);                                 \
+        block->field = f16_2_lora(dit, name, rows, columns, lora_a, lora_b, error, error_size);     \
+    } else {                                                                                        \
+        block->field = f16_2(dit, name, rows, columns, error, error_size);                          \
+    }                                                                                               \
+    if (!block->field) return 0;                                                                    \
+} while (0)
+    LOAD1_BF16(norm1, "norm1.weight", HIDDEN);
+    LOAD1_BF16(norm2, "norm2.weight", HIDDEN);
+    if (dit->use_f16_dit) {
+        LOAD2_F16(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN, "attn.qkv_proj.lora_A.weight", "attn.qkv_proj.lora_B.weight");
+        LOAD1_F16(q_norm, "attn.q_norm.weight", HEAD_DIM);
+        LOAD1_F16(k_norm, "attn.k_norm.weight", HEAD_DIM);
+        LOAD2_F16(out, "attn.out_proj.weight", HIDDEN, INNER, "attn.out_proj.lora_A.weight", "attn.out_proj.lora_B.weight");
+        LOAD2_F16(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN, "mlp.fc1.lora_A.weight", "mlp.fc1.lora_B.weight");
+        LOAD2_F16(fc2, "mlp.fc2.weight", HIDDEN, FFN, "mlp.fc2.lora_A.weight", "mlp.fc2.lora_B.weight");
+    } else {
+        LOAD2_BF16(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN, "attn.qkv_proj.lora_A.weight", "attn.qkv_proj.lora_B.weight");
+        LOAD1_BF16(q_norm, "attn.q_norm.weight", HEAD_DIM);
+        LOAD1_BF16(k_norm, "attn.k_norm.weight", HEAD_DIM);
+        LOAD2_BF16(out, "attn.out_proj.weight", HIDDEN, INNER, "attn.out_proj.lora_A.weight", "attn.out_proj.lora_B.weight");
+        LOAD2_BF16(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN, "mlp.fc1.lora_A.weight", "mlp.fc1.lora_B.weight");
+        LOAD2_BF16(fc2, "mlp.fc2.weight", HIDDEN, FFN, "mlp.fc2.lora_A.weight", "mlp.fc2.lora_B.weight");
+    }
+#undef LOAD1_BF16
+#undef LOAD2_BF16
+    return 1;
+}
+
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
                       char *error, size_t error_size) {
     char name[160];
-#define LOAD1(field, suffix, width) do {                                       \
-    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
-    block->field = bf1(dit, name, width, error, error_size);                    \
-    if (!block->field) return 0;                                                \
+    char lora_a[160];
+    char lora_b[160];
+#define LOAD1_BF16(field, suffix, width) do {                                                       \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                                           \
+    block->field = bf16_1(dit, name, width, error, error_size);                                     \
+    if (!block->field) return 0;                                                                    \
 } while (0)
-#define LOAD2(field, suffix, rows, columns) do {                               \
-    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
-    block->field = bf2(dit, name, rows, columns, error, error_size);            \
-    if (!block->field) return 0;                                                \
+#define LOAD2_BF16(field, suffix, rows, columns, suffix_a, suffix_b) do {                           \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                                           \
+    if (suffix_a && suffix_a) {                                                                     \
+        snprintf(lora_a, sizeof(lora_a), "%s%s", prefix, suffix_a);                                 \
+        snprintf(lora_b, sizeof(lora_b), "%s%s", prefix, suffix_b);                                 \
+        block->field = bf16_2_lora(dit, name, rows, columns, lora_a, lora_b, error, error_size);    \
+    } else {                                                                                        \
+        block->field = bf16_2(dit, name, rows, columns, error, error_size);                         \
+    }                                                                                               \
+    if (!block->field) return 0;                                                                    \
 } while (0)
-    LOAD1(norm1, "norm1.weight", HIDDEN);
-    LOAD1(norm2, "norm2.weight", HIDDEN);
-    LOAD2(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
-    LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
-    LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
-    LOAD2(out, "attn.out_proj.weight", HIDDEN, INNER);
-    LOAD2(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
-    LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
-#undef LOAD1
-#undef LOAD2
+#define LOAD1_F16(field, suffix, width) do {                                                        \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                                           \
+    block->field = f16_1(dit, name, width, error, error_size);                                      \
+    if (!block->field) return 0;                                                                    \
+} while (0)
+#define LOAD2_F16(field, suffix, rows, columns, suffix_a, suffix_b) do {                            \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                                           \
+    if (suffix_a && suffix_a) {                                                                     \
+        snprintf(lora_a, sizeof(lora_a), "%s%s", prefix, suffix_a);                                 \
+        snprintf(lora_b, sizeof(lora_b), "%s%s", prefix, suffix_b);                                 \
+        block->field = f16_2_lora(dit, name, rows, columns, lora_a, lora_b, error, error_size);     \
+    } else {                                                                                        \
+        block->field = f16_2(dit, name, rows, columns, error, error_size);                          \
+    }                                                                                               \
+    if (!block->field) return 0;                                                                    \
+} while (0)
+    LOAD1_BF16(norm1, "norm1.weight", HIDDEN);
+    LOAD1_BF16(norm2, "norm2.weight", HIDDEN);
+    if (dit->use_f16_dit) {
+        LOAD2_F16(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN, "attn.qkv_proj.lora_A.weight", "attn.qkv_proj.lora_B.weight");
+        LOAD1_F16(q_norm, "attn.q_norm.weight", HEAD_DIM);
+        LOAD1_F16(k_norm, "attn.k_norm.weight", HEAD_DIM);
+        LOAD2_F16(out, "attn.out_proj.weight", HIDDEN, INNER, "attn.out_proj.lora_A.weight", "attn.out_proj.lora_B.weight");
+        LOAD2_F16(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN, "mlp.fc1.lora_A.weight", "mlp.fc1.lora_B.weight");
+        LOAD2_F16(fc2, "mlp.fc2.weight", HIDDEN, FFN, "mlp.fc2.lora_A.weight", "mlp.fc2.lora_B.weight");
+    } else {
+        LOAD2_BF16(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN, "attn.qkv_proj.lora_A.weight", "attn.qkv_proj.lora_B.weight");
+        LOAD1_BF16(q_norm, "attn.q_norm.weight", HEAD_DIM);
+        LOAD1_BF16(k_norm, "attn.k_norm.weight", HEAD_DIM);
+        LOAD2_BF16(out, "attn.out_proj.weight", HIDDEN, INNER, "attn.out_proj.lora_A.weight", "attn.out_proj.lora_B.weight");
+        LOAD2_BF16(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN, "mlp.fc1.lora_A.weight", "mlp.fc1.lora_B.weight");
+        LOAD2_BF16(fc2, "mlp.fc2.weight", HIDDEN, FFN, "mlp.fc2.lora_A.weight", "mlp.fc2.lora_B.weight");
+    }
+#undef LOAD1_BF16
+#undef LOAD2_BF16
+#undef LOAD1_F16
+#undef LOAD2_F16
     return 1;
 }
 
@@ -529,15 +664,24 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
                             const char *prefix,
                             char *error, size_t error_size) {
     char name[160];
-#define LOAD1(field, suffix, width) do {                                       \
+#define LOAD1_BF16(field, suffix, width) do {                                       \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
-    block->field = bf1(dit, name, width, error, error_size);                    \
+    block->field = bf16_1(dit, name, width, error, error_size);                    \
     if (!block->field) return 0;                                                \
 } while (0)
-    LOAD1(norm1, "norm1.weight", HIDDEN);
-    LOAD1(norm2, "norm2.weight", HIDDEN);
-    LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
-    LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
+#define LOAD1_F16(field, suffix, width) do {                                       \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
+    block->field = f16_1(dit, name, width, error, error_size);                    \
+    if (!block->field) return 0;                                                \
+} while (0)
+    LOAD1_BF16(norm1, "norm1.weight", HIDDEN);
+    LOAD1_BF16(norm2, "norm2.weight", HIDDEN);
+    if (dit->use_f16_dit) {
+        LOAD1_F16(q_norm, "attn.q_norm.weight", HEAD_DIM);
+        LOAD1_F16(k_norm, "attn.k_norm.weight", HEAD_DIM);
+    } else {
+        LOAD1_BF16(q_norm, "attn.q_norm.weight", HEAD_DIM);
+        LOAD1_BF16(k_norm, "attn.k_norm.weight", HEAD_DIM);
 #undef LOAD1
     return 1;
 }
@@ -578,9 +722,10 @@ static int compare_stream_sources(const void *left, const void *right) {
 
 static int prepare_stream_source(h3_dit *dit,
                                  h3_dit_stream_source *source,
-                                 const char *name, uint64_t rows,
-                                 uint64_t columns, unsigned field,
+                                 const char *name, h3_dtype dtype,
+                                 uint64_t rows, uint64_t columns, unsigned field,
                                  char *error, size_t error_size) {
+    source->path = NULL;
     const h3_st_header *header = NULL;
     const h3_st_tensor *tensor = h3_weight_find(dit->weights, name, &header);
     if (!tensor) {
@@ -588,7 +733,7 @@ static int prepare_stream_source(h3_dit *dit,
              name);
         return 0;
     }
-    if (!header || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
+    if (!header || tensor->dtype != dtype || tensor->ndim != 2 ||
         tensor->shape[0] != rows || tensor->shape[1] != columns ||
         rows > SIZE_MAX / columns) {
         fail(error, error_size, "streaming weight has the wrong schema: %s",
@@ -602,21 +747,48 @@ static int prepare_stream_source(h3_dit *dit,
     return 1;
 }
 
+// TODO: Finish implementing lora for streaming
 static int prepare_stream_layer(h3_dit *dit, unsigned layer,
                                 char *error, size_t error_size) {
     char name[160];
     h3_dit_stream_layer *stream = &dit->stream_layers[layer];
-#define SOURCE(index, suffix, rows, columns, field) do {                        \
-    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);              \
-    if (!prepare_stream_source(dit, &stream->sources[index], name,             \
-                               rows, columns, field, error, error_size))        \
-        return 0;                                                               \
+#define SOURCE_F16(index, suffix, rows, columns, field, suffix_a, suffix_b) do {    \
+    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);                    \
+    if (!prepare_stream_source(dit, &stream->sources[index], name, H3_DTYPE_F16,    \
+                               rows, columns, field, error, error_size))            \
+        return 0;                                                                   \
+    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix_a);                  \
+    prepare_stream_source(dit, &stream->lora_a[index], name, H3_DTYPE_F16,          \
+                               rows, columns, field, error, error_size);            \
+    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix_b);                  \
+    prepare_stream_source(dit, &stream->lora_b[index], name, H3_DTYPE_F16,          \
+                               rows, columns, field, error, error_size);            \
 } while (0)
-    SOURCE(0, "attn.qkv_proj.weight", INNER * 3, HIDDEN, STREAM_QKV);
-    SOURCE(1, "attn.out_proj.weight", HIDDEN, INNER, STREAM_OUT);
-    SOURCE(2, "mlp.fc1.weight", FFN * 2, HIDDEN, STREAM_FC1);
-    SOURCE(3, "mlp.fc2.weight", HIDDEN, FFN, STREAM_FC2);
-#undef SOURCE
+#define SOURCE_BF16(index, suffix, rows, columns, field, suffix_a, suffix_b) do {   \
+    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);                    \
+    if (!prepare_stream_source(dit, &stream->sources[index], name, H3_DTYPE_BF16,   \
+                               rows, columns, field, error, error_size))            \
+        return 0;                                                                   \
+    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix_a);                  \
+    prepare_stream_source(dit, &stream->lora_a[index], name, H3_DTYPE_BF16,         \
+                               rows, columns, field, error, error_size);            \
+    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix_b);                  \
+    prepare_stream_source(dit, &stream->lora_b[index], name, H3_DTYPE_BF16,         \
+                               rows, columns, field, error, error_size);            \
+} while (0)
+    if (dit->use_f16_dit) {
+        SOURCE_F16(0, "attn.qkv_proj.weight", INNER * 3, HIDDEN, STREAM_QKV, "attn.qkv_proj.lora_A.weight", "attn.qkv_proj.lora_B.weight");
+        SOURCE_F16(1, "attn.out_proj.weight", HIDDEN, INNER, STREAM_OUT, "attn.out_proj.lora_A.weight", "attn.out_proj.lora_B.weight");
+        SOURCE_F16(2, "mlp.fc1.weight", FFN * 2, HIDDEN, STREAM_FC1, "mlp.fc1.lora_A.weight", "mlp.fc1.lora_B.weight");
+        SOURCE_F16(3, "mlp.fc2.weight", HIDDEN, FFN, STREAM_FC2, "mlp.fc2.lora_A.weight", "mlp.fc2.lora_B.weight");
+    } else {
+        SOURCE_BF16(0, "attn.qkv_proj.weight", INNER * 3, HIDDEN, STREAM_QKV, "attn.qkv_proj.lora_A.weight", "attn.qkv_proj.lora_B.weight");
+        SOURCE_BF16(1, "attn.out_proj.weight", HIDDEN, INNER, STREAM_OUT, "attn.out_proj.lora_A.weight", "attn.out_proj.lora_B.weight");
+        SOURCE_BF16(2, "mlp.fc1.weight", FFN * 2, HIDDEN, STREAM_FC1, "mlp.fc1.lora_A.weight", "mlp.fc1.lora_B.weight");
+        SOURCE_BF16(3, "mlp.fc2.weight", HIDDEN, FFN, STREAM_FC2, "mlp.fc2.lora_A.weight", "mlp.fc2.lora_B.weight");
+    }
+#undef SOURCE_F16
+#undef SOURCE_BF16
     qsort(stream->sources, STREAM_MATRICES, sizeof(stream->sources[0]),
           compare_stream_sources);
     return 1;
@@ -624,14 +796,17 @@ static int prepare_stream_layer(h3_dit *dit, unsigned layer,
 
 static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
                                 char *error, size_t error_size) {
-    slot->qkv = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)INNER * 3 * HIDDEN);
-    slot->out = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)HIDDEN * INNER);
-    slot->fc1 = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)FFN * 2 * HIDDEN);
-    slot->fc2 = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)HIDDEN * FFN);
+    if (dit->use_f16_dit) {
+        slot->qkv = h3_gpu_tensor_new(dit->gpu, (size_t)INNER * 3 * HIDDEN, H3_GPU_F16);
+        slot->out = h3_gpu_tensor_new(dit->gpu, (size_t)HIDDEN * INNER, H3_GPU_F16);
+        slot->fc1 = h3_gpu_tensor_new(dit->gpu, (size_t)FFN * 2 * HIDDEN, H3_GPU_F16);
+        slot->fc2 = h3_gpu_tensor_new(dit->gpu, (size_t)HIDDEN * FFN, H3_GPU_F16);
+    } else {
+        slot->qkv = h3_gpu_tensor_new(dit->gpu, (size_t)INNER * 3 * HIDDEN, H3_GPU_BF16);
+        slot->out = h3_gpu_tensor_new(dit->gpu, (size_t)HIDDEN * INNER, H3_GPU_BF16);
+        slot->fc1 = h3_gpu_tensor_new(dit->gpu, (size_t)FFN * 2 * HIDDEN, H3_GPU_BF16);
+        slot->fc2 = h3_gpu_tensor_new(dit->gpu, (size_t)HIDDEN * FFN, H3_GPU_BF16);
+    }
     if (!slot->qkv || !slot->out || !slot->fc1 || !slot->fc2) {
         fail(error, error_size, "cannot allocate BF16 SSD layer slot: %s",
              h3_gpu_error(dit->gpu));
@@ -691,12 +866,10 @@ static void *read_stream_layer_thread(void *opaque) {
 
 static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
-    block->fc1_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)FFN * 2 * HIDDEN);
-    block->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
-    block->fc2_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)HIDDEN * FFN);
-    block->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    block->fc1_int8 = h3_gpu_tensor_new(dit->gpu, (size_t)FFN * 2 * HIDDEN, H3_GPU_I8);
+    block->fc1_scales = h3_gpu_tensor_new(dit->gpu, FFN * 2, H3_GPU_F32);
+    block->fc2_int8 = h3_gpu_tensor_new(dit->gpu, (size_t)HIDDEN * FFN, H3_GPU_I8);
+    block->fc2_scales = h3_gpu_tensor_new(dit->gpu, HIDDEN, H3_GPU_F32);
     int ok = block->fc1_int8 && block->fc1_scales &&
              block->fc2_int8 && block->fc2_scales &&
              h3_gpu_begin(dit->gpu) &&
@@ -721,9 +894,9 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
 
 static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
-    block->qkv_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)INNER * 3 * HIDDEN);
-    block->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+    block->qkv_int8 = h3_gpu_tensor_new(
+        dit->gpu, (size_t)INNER * 3 * HIDDEN, H3_GPU_I8);
+    block->qkv_scales = h3_gpu_tensor_new(dit->gpu, INNER * 3, H3_GPU_F32);
     int ok = block->qkv_int8 && block->qkv_scales &&
              h3_gpu_begin(dit->gpu) &&
              h3_gpu_quantize_weight_int8(
@@ -741,9 +914,9 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
 
 static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
                                         char *error, size_t error_size) {
-    block->out_int8 = h3_gpu_tensor_new_i8(
-        dit->gpu, (size_t)HIDDEN * INNER);
-    block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    block->out_int8 = h3_gpu_tensor_new(
+        dit->gpu, (size_t)HIDDEN * INNER, H3_GPU_I8);
+    block->out_scales = h3_gpu_tensor_new(dit->gpu, HIDDEN, H3_GPU_F32);
     int ok = block->out_int8 && block->out_scales &&
              h3_gpu_begin(dit->gpu) &&
              h3_gpu_quantize_weight_int8(
@@ -771,43 +944,75 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
-    OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm1, rows,
-                             HIDDEN, 1e-5f), "refiner attention norm");
-    OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
-                           HIDDEN, INNER * 3), "refiner QKV");
-    OP(h3_gpu_grouped_qkv_rope_bf16(
-                             dit->gpu, query, key, value, qkv, weight->q_norm,
-                             weight->k_norm, weight->q_norm, weight->q_norm,
-                             rows, HEADS, HEAD_DIM, 0, 1e-5f),
-       "refiner QK norm");
-    OP(h3_gpu_sdpa_bf16(dit->gpu, heads, query, key, value, rows, HEADS,
-                         HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-       "refiner attention");
-    OP(h3_gpu_linear_bf16(dit->gpu, branch, heads, weight->out, NULL, rows,
-                           INNER, HIDDEN), "refiner attention output");
-    OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
-       "refiner attention residual");
-    OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
-                             HIDDEN, 1e-5f), "refiner MLP norm");
-    OP(h3_gpu_linear_bf16(dit->gpu, fc1, norm, weight->fc1, NULL, rows,
-                           HIDDEN, FFN * 2), "refiner MLP input");
-    OP(h3_gpu_swiglu_bf16(dit->gpu, activated, fc1, rows, FFN),
-       "refiner SwiGLU");
-    OP(h3_gpu_linear_bf16(dit->gpu, branch, activated, weight->fc2, NULL,
-                           rows, FFN, HIDDEN), "refiner MLP output");
-    OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
-       "refiner MLP residual");
+    if (dit->use_f16_dit) {
+        OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm1, rows, HIDDEN, 1e-5f),
+            "refiner f16 attention norm");
+        OP(h3_gpu_grouped_qkv_linear_rope_f16(dit->gpu, query, key, value, qkv,
+                                            norm, weight->qkv, weight->q_norm, weight->k_norm,
+                                            weight->q_norm, weight->k_norm,
+                                            rows, HIDDEN, HEADS, HEAD_DIM, 0, 1e-5f),
+            "refiner f16 QKV/norm/RoPE");
+        OP(h3_gpu_sdpa_f16(dit->gpu, qkv, query, key, value, rows, HEADS,
+                            HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+            "refiner f16 attention");
+        OP(h3_gpu_linear_f16_scale_64(dit->gpu, branch, qkv, weight->out, NULL, rows,
+                                    INNER, HIDDEN),
+            "refiner f16 attention output scale 64");
+        OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
+           "refiner f16 attention residual");
+        OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
+                                 HIDDEN, 1e-5f),
+            "refiner f16 MLP norm");
+        OP(h3_gpu_mlp_f16_scale_256(dit->gpu, branch, norm,
+            weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
+            "refiner f16 fused MLP scale 256");
+        OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
+           "refiner f16 MLP residual");
+    } else {
+        OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm1, rows,
+                                 HIDDEN, 1e-5f),
+            "refiner attention norm");
+        OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
+                               HIDDEN, INNER * 3),
+            "refiner QKV");
+        OP(h3_gpu_grouped_qkv_rope_bf16(
+                                 dit->gpu, query, key, value, qkv, weight->q_norm, weight->k_norm,
+                                 weight->q_norm, weight->q_norm,
+                                 rows, HEADS, HEAD_DIM, 0, 1e-5f),
+           "refiner QK norm");
+        OP(h3_gpu_sdpa_bf16(dit->gpu, heads, query, key, value, rows, HEADS,
+                             HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+           "refiner attention");
+        OP(h3_gpu_linear_bf16(dit->gpu, branch, heads, weight->out, NULL, rows,
+                               INNER, HIDDEN),
+            "refiner attention output");
+        OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
+           "refiner attention residual");
+        OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
+                                 HIDDEN, 1e-5f),
+            "refiner MLP norm");
+        OP(h3_gpu_linear_bf16(dit->gpu, fc1, norm, weight->fc1, NULL, rows,
+                               HIDDEN, FFN * 2),
+            "refiner MLP input");
+        OP(h3_gpu_swiglu_bf16(dit->gpu, activated, fc1, rows, FFN),
+           "refiner SwiGLU");
+        OP(h3_gpu_linear_bf16(dit->gpu, branch, activated, weight->fc2, NULL,
+                               rows, FFN, HIDDEN),
+            "refiner MLP output");
+        OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
+           "refiner MLP residual");
+    }
 #undef OP
     return 1;
 }
 
 static int refine_text(h3_dit *dit, const h3_text_embedding *text,
                        char *error, size_t error_size) {
-    h3_gpu_tensor *source = h3_gpu_tensor_from_bf16(
-        dit->gpu, text->values, text->tokens * TEXT_DIM);
-    h3_gpu_tensor *condition_w = bf2(dit, "condition_proj.weight", HIDDEN,
+    h3_gpu_tensor *source = h3_gpu_tensor_load(
+        dit->gpu, text->values, text->tokens * TEXT_DIM, H3_GPU_BF16);
+    h3_gpu_tensor *condition_w = bf16_2(dit, "condition_proj.weight", HIDDEN,
                                      TEXT_DIM, error, error_size);
-    h3_gpu_tensor *condition_b = bf1(dit, "condition_proj.bias", HIDDEN,
+    h3_gpu_tensor *condition_b = bf16_1(dit, "condition_proj.bias", HIDDEN,
                                      error, error_size);
     h3_dit_block refiner[2];
     memset(refiner, 0, sizeof(refiner));
@@ -816,26 +1021,35 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
     h3_gpu_tensor *value = NULL, *heads = NULL, *branch = NULL, *fc1 = NULL;
     h3_gpu_tensor *activated = NULL;
     int ok = source && condition_w && condition_b &&
-        load_block(dit, &refiner[0], "token_refiner.blocks.0.",
+        load_refiner_block(dit, &refiner[0], "token_refiner.blocks.0.",
                    error, error_size) &&
-        load_block(dit, &refiner[1], "token_refiner.blocks.1.",
+        load_refiner_block(dit, &refiner[1], "token_refiner.blocks.1.",
                    error, error_size);
-    if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
+    if (ok) final_norm = bf16_1(dit, "token_refiner.final_norm.weight", HIDDEN,
                              error, error_size);
     size_t rows = dit->text_rows;
     if (ok && final_norm) {
-        dit->refined_text = h3_gpu_tensor_new_bf16(dit->gpu, rows * HIDDEN);
-        norm = h3_gpu_tensor_new_bf16(dit->gpu, rows * HIDDEN);
-        qkv = h3_gpu_tensor_new_bf16(dit->gpu, rows * INNER * 3);
-        query = h3_gpu_tensor_new_bf16(dit->gpu, rows * INNER);
-        key = h3_gpu_tensor_new_bf16(dit->gpu, rows * INNER);
-        value = h3_gpu_tensor_new_bf16(dit->gpu, rows * INNER);
-        heads = h3_gpu_tensor_new_bf16(dit->gpu, rows * INNER);
-        branch = h3_gpu_tensor_new_bf16(dit->gpu, rows * HIDDEN);
-        fc1 = h3_gpu_tensor_new_bf16(dit->gpu, rows * FFN * 2);
-        activated = h3_gpu_tensor_new_bf16(dit->gpu, rows * FFN);
-        ok = dit->refined_text && norm && qkv && query && key && value &&
-             heads && branch && fc1 && activated;
+        dit->refined_text = h3_gpu_tensor_new(dit->gpu, rows * HIDDEN, H3_GPU_BF16);
+        norm = h3_gpu_tensor_new(dit->gpu, rows * HIDDEN, H3_GPU_BF16);
+        branch = h3_gpu_tensor_new(dit->gpu, rows * HIDDEN, H3_GPU_BF16);
+        if (dit->use_f16_dit) {
+            qkv = h3_gpu_tensor_new(dit->gpu, rows * INNER * 3, H3_GPU_F16);
+            query = h3_gpu_tensor_new(dit->gpu, rows * INNER, H3_GPU_F16);
+            key = h3_gpu_tensor_new(dit->gpu, rows * INNER, H3_GPU_F16);
+            value = h3_gpu_tensor_new(dit->gpu, rows * INNER, H3_GPU_F16);
+            // heads is aliased to qkv
+            ok = dit->refined_text && norm && qkv && query && key && value && branch;
+        } else {
+            qkv = h3_gpu_tensor_new(dit->gpu, rows * INNER * 3, H3_GPU_BF16);
+            query = h3_gpu_tensor_new(dit->gpu, rows * INNER, H3_GPU_BF16);
+            key = h3_gpu_tensor_new(dit->gpu, rows * INNER, H3_GPU_BF16);
+            value = h3_gpu_tensor_new(dit->gpu, rows * INNER, H3_GPU_BF16);
+            heads = h3_gpu_tensor_new(dit->gpu, rows * INNER, H3_GPU_BF16);
+            fc1 = h3_gpu_tensor_new(dit->gpu, rows * FFN * 2, H3_GPU_BF16);
+            activated = h3_gpu_tensor_new(dit->gpu, rows * FFN, H3_GPU_BF16);
+            ok = dit->refined_text && norm && qkv && query && key && value &&
+                 heads && branch && fc1 && activated;
+        }
     }
     if (!ok) {
         if (!error || !*error)
@@ -881,7 +1095,7 @@ cleanup:
 }
 
 static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
-    h3_gpu_tensor *inverse_tensor = f1(dit, "rope.inv_freq", ROPE_FREQS,
+    h3_gpu_tensor *inverse_tensor = f32_1(dit, "rope.inv_freq", ROPE_FREQS,
                                        error, error_size);
     float inverse[ROPE_FREQS];
     if (!inverse_tensor ||
@@ -945,23 +1159,34 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
             }
         }
     }
-    h3_gpu_tensor *cos_f32 = h3_gpu_tensor_from_f32(dit->gpu, cosines, count);
-    h3_gpu_tensor *sin_f32 = h3_gpu_tensor_from_f32(dit->gpu, sines, count);
+    h3_gpu_tensor *cos_f32 = h3_gpu_tensor_load(dit->gpu, cosines, count, H3_GPU_F32);
+    h3_gpu_tensor *sin_f32 = h3_gpu_tensor_load(dit->gpu, sines, count, H3_GPU_F32);
     h3_gpu_tensor *reduced_cos_f32 = reduced_count ?
-        h3_gpu_tensor_from_f32(dit->gpu, reduced_cosines, reduced_count) : NULL;
+        h3_gpu_tensor_load(dit->gpu, reduced_cosines, reduced_count, H3_GPU_F32) : NULL;
     h3_gpu_tensor *reduced_sin_f32 = reduced_count ?
-        h3_gpu_tensor_from_f32(dit->gpu, reduced_sines, reduced_count) : NULL;
+        h3_gpu_tensor_load(dit->gpu, reduced_sines, reduced_count, H3_GPU_F32) : NULL;
     free(cosines);
     free(sines);
     free(reduced_cosines);
     free(reduced_sines);
-    dit->rope_cos = h3_gpu_tensor_new_bf16(dit->gpu, count);
-    dit->rope_sin = h3_gpu_tensor_new_bf16(dit->gpu, count);
-    if (reduced_count) {
-        dit->reduced_rope_cos = h3_gpu_tensor_new_bf16(
-            dit->gpu, reduced_count);
-        dit->reduced_rope_sin = h3_gpu_tensor_new_bf16(
-            dit->gpu, reduced_count);
+    if (dit->use_f16_dit) {
+        dit->rope_cos = h3_gpu_tensor_new(dit->gpu, count, H3_GPU_F16);
+        dit->rope_sin = h3_gpu_tensor_new(dit->gpu, count, H3_GPU_F16);
+        if (reduced_count) {
+            dit->reduced_rope_cos = h3_gpu_tensor_new(
+                dit->gpu, reduced_count, H3_GPU_F16);
+            dit->reduced_rope_sin = h3_gpu_tensor_new(
+                dit->gpu, reduced_count, H3_GPU_F16);
+        }
+    } else {
+        dit->rope_cos = h3_gpu_tensor_new(dit->gpu, count, H3_GPU_BF16);
+        dit->rope_sin = h3_gpu_tensor_new(dit->gpu, count, H3_GPU_BF16);
+        if (reduced_count) {
+            dit->reduced_rope_cos = h3_gpu_tensor_new(
+                dit->gpu, reduced_count, H3_GPU_BF16);
+            dit->reduced_rope_sin = h3_gpu_tensor_new(
+                dit->gpu, reduced_count, H3_GPU_BF16);
+        }
     }
     int ok = cos_f32 && sin_f32 && dit->rope_cos && dit->rope_sin &&
         (!reduced_count || (reduced_cos_f32 && reduced_sin_f32 &&
@@ -970,18 +1195,18 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
     if (ok) {
         ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
                     "begin RoPE setup") &&
-             gpu_op(dit, h3_gpu_cast_f32_to_bf16(
+            gpu_op(dit, h3_gpu_cast(
                  dit->gpu, dit->rope_cos, cos_f32, (uint32_t)count),
                  error, error_size, "RoPE cosine cast") &&
-             gpu_op(dit, h3_gpu_cast_f32_to_bf16(
+            gpu_op(dit, h3_gpu_cast(
                  dit->gpu, dit->rope_sin, sin_f32, (uint32_t)count),
                  error, error_size, "RoPE sine cast");
         if (ok && reduced_count) {
-            ok = gpu_op(dit, h3_gpu_cast_f32_to_bf16(
+            ok = gpu_op(dit, h3_gpu_cast(
                      dit->gpu, dit->reduced_rope_cos, reduced_cos_f32,
                      (uint32_t)reduced_count), error, error_size,
                      "reduced RoPE cosine cast") &&
-                 gpu_op(dit, h3_gpu_cast_f32_to_bf16(
+                gpu_op(dit, h3_gpu_cast(
                      dit->gpu, dit->reduced_rope_sin, reduced_sin_f32,
                      (uint32_t)reduced_count), error, error_size,
                      "reduced RoPE sine cast");
@@ -998,6 +1223,13 @@ static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
     free_tensor(&reduced_cos_f32);
     free_tensor(&reduced_sin_f32);
     return ok;
+}
+
+static void free_rope(h3_dit *dit) {
+    free_tensor(&dit->rope_cos);
+    free_tensor(&dit->rope_sin);
+    free_tensor(&dit->reduced_rope_cos);
+    free_tensor(&dit->reduced_rope_sin);
 }
 
 static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
@@ -1038,8 +1270,8 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
                 (void)second;
                 reduced[row] = rows[first];
             }
-            dit->reduced_row_maps[step] = h3_gpu_tensor_from_u32(
-                dit->gpu, reduced, dit->reduced_sequence);
+            dit->reduced_row_maps[step] = h3_gpu_tensor_load(
+                dit->gpu, reduced, dit->reduced_sequence, H3_GPU_U32);
         }
         uint32_t audio_row = h3_dit_schedule_audio_row(dit->schedule, step);
         uint32_t video_row = h3_dit_schedule_video_row(dit->schedule, step);
@@ -1047,12 +1279,12 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
             audio[index] = audio_row;
         for (uint32_t index = 0; index < dit->video_rows; index++)
             video[index] = video_row;
-        dit->row_maps[step] = h3_gpu_tensor_from_u32(
-            dit->gpu, rows, dit->sequence);
-        dit->final_audio_maps[step] = h3_gpu_tensor_from_u32(
-            dit->gpu, audio, dit->audio_rows);
-        dit->final_video_maps[step] = h3_gpu_tensor_from_u32(
-            dit->gpu, video, dit->video_rows);
+        dit->row_maps[step] = h3_gpu_tensor_load(
+            dit->gpu, rows, dit->sequence, H3_GPU_U32);
+        dit->final_audio_maps[step] = h3_gpu_tensor_load(
+            dit->gpu, audio, dit->audio_rows, H3_GPU_U32);
+        dit->final_video_maps[step] = h3_gpu_tensor_load(
+            dit->gpu, video, dit->video_rows, H3_GPU_U32);
         if (!dit->row_maps[step] ||
             (dit->token_reduction && !dit->reduced_row_maps[step]) ||
             !dit->final_audio_maps[step] ||
@@ -1065,6 +1297,22 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
     }
     free(rows); free(reduced); free(audio); free(video);
     return 1;
+}
+
+static void free_maps(h3_dit *dit) {
+    int steps = h3_dit_schedule_steps(dit->schedule);
+    if (dit->row_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->row_maps[step]);
+    if (dit->reduced_row_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->reduced_row_maps[step]);
+    if (dit->final_audio_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->final_audio_maps[step]);
+    if (dit->final_video_maps) for (int step = 0; step < steps; step++)
+        h3_gpu_tensor_free(dit->final_video_maps[step]);
+    free(dit->row_maps);
+    free(dit->reduced_row_maps);
+    free(dit->final_audio_maps);
+    free(dit->final_video_maps);
 }
 
 static int prepare_projection_maps(h3_dit *dit, char *error,
@@ -1110,11 +1358,11 @@ static int prepare_projection_maps(h3_dit *dit, char *error,
         return 0;
     }
     if (video)
-        dit->video_projection_map = h3_gpu_tensor_from_u32(
-            dit->gpu, video, dit->video_total_rows);
+        dit->video_projection_map = h3_gpu_tensor_load(
+            dit->gpu, video, dit->video_total_rows, H3_GPU_U32);
     if (audio)
-        dit->audio_projection_map = h3_gpu_tensor_from_u32(
-            dit->gpu, audio, dit->audio_total_rows);
+        dit->audio_projection_map = h3_gpu_tensor_load(
+            dit->gpu, audio, dit->audio_total_rows, H3_GPU_U32);
     free(video); free(audio);
     if ((video_segments > 1 && !dit->video_projection_map) ||
         (audio_segments > 1 && !dit->audio_projection_map)) {
@@ -1123,6 +1371,11 @@ static int prepare_projection_maps(h3_dit *dit, char *error,
         return 0;
     }
     return 1;
+}
+
+static void free_projection_maps(h3_dit *dit) {
+    free_tensor(&dit->video_projection_map);
+    free_tensor(&dit->audio_projection_map);
 }
 
 static int prepare_token_reduction_maps(h3_dit *dit, char *error,
@@ -1159,12 +1412,12 @@ static int prepare_token_reduction_maps(h3_dit *dit, char *error,
     }
     for (uint32_t row = 0; row < dit->sequence; row++)
         parents[row] = token_reduced_parent(dit, row);
-    dit->token_pool_pairs = h3_gpu_tensor_from_u32(
-        dit->gpu, pairs, pair_count);
-    dit->token_baseline_indices = h3_gpu_tensor_from_u32(
-        dit->gpu, baseline_indices, dit->reduced_sequence);
-    dit->token_expand_parents = h3_gpu_tensor_from_u32(
-        dit->gpu, parents, dit->sequence);
+    dit->token_pool_pairs = h3_gpu_tensor_load(
+        dit->gpu, pairs, pair_count, H3_GPU_U32);
+    dit->token_baseline_indices = h3_gpu_tensor_load(
+        dit->gpu, baseline_indices, dit->reduced_sequence, H3_GPU_U32);
+    dit->token_expand_parents = h3_gpu_tensor_load(
+        dit->gpu, parents, dit->sequence, H3_GPU_U32);
     free(pairs);
     free(baseline_indices);
     free(parents);
@@ -1176,6 +1429,34 @@ static int prepare_token_reduction_maps(h3_dit *dit, char *error,
         return 0;
     }
     return 1;
+}
+
+static void free_token_reduction_maps(h3_dit *dit) {
+    free_tensor(&dit->token_pool_pairs);
+    free_tensor(&dit->token_baseline_indices);
+    free_tensor(&dit->token_expand_parents);
+}
+
+static int prepare_previous_velocities(h3_dit *dit, char *error,
+                                      size_t error_size) {
+    if (dit->previous_video_velocity && dit->previous_audio_velocity) return 1;
+    free_tensor(&dit->previous_video_velocity);
+    free_tensor(&dit->previous_audio_velocity);
+    dit->previous_video_velocity = h3_gpu_tensor_new(
+        dit->gpu, (size_t)dit->video_rows * VIDEO_PATCH, H3_GPU_BF16);
+    dit->previous_audio_velocity = h3_gpu_tensor_new(
+        dit->gpu, (size_t)dit->audio_rows * AUDIO_CHANNELS, H3_GPU_BF16);
+    if (dit->previous_video_velocity && dit->previous_audio_velocity) return 1;
+    free_tensor(&dit->previous_video_velocity);
+    free_tensor(&dit->previous_audio_velocity);
+    fail(error, error_size, "cannot allocate GPU Euler velocity cache: %s",
+         h3_gpu_error(dit->gpu));
+    return 0;
+}
+
+static void free_previous_velocities(h3_dit *dit) {
+    free_tensor(&dit->previous_video_velocity);
+    free_tensor(&dit->previous_audio_velocity);
 }
 
 static void configure_active_blocks(h3_dit *dit, unsigned active) {
@@ -1292,23 +1573,23 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         dit->stream_bytes += job.bytes;
         dit->stream_read_seconds += job.seconds;
     }
-    dit->video_patch_w = f2(dit, "video_patch_proj.weight", HIDDEN,
+    dit->video_patch_w = f32_2(dit, "video_patch_proj.weight", HIDDEN,
                             VIDEO_PATCH, error, error_size);
-    dit->video_patch_b = f1(dit, "video_patch_proj.bias", HIDDEN,
+    dit->video_patch_b = f32_1(dit, "video_patch_proj.bias", HIDDEN,
                             error, error_size);
-    dit->audio_patch_w = f2(dit, "audio_patch_proj.weight", HIDDEN,
+    dit->audio_patch_w = f32_2(dit, "audio_patch_proj.weight", HIDDEN,
                             AUDIO_CHANNELS, error, error_size);
-    dit->audio_patch_b = f1(dit, "audio_patch_proj.bias", HIDDEN,
+    dit->audio_patch_b = f32_1(dit, "audio_patch_proj.bias", HIDDEN,
                             error, error_size);
-    dit->final_norm = bf1(dit, "final_layer.norm.weight", HIDDEN,
+    dit->final_norm = bf16_1(dit, "final_layer.norm.weight", HIDDEN,
                           error, error_size);
-    dit->final_video_w = f2(dit, "final_layer.video_out.weight", VIDEO_PATCH,
+    dit->final_video_w = f32_2(dit, "final_layer.video_out.weight", VIDEO_PATCH,
                             HIDDEN, error, error_size);
-    dit->final_video_b = f1(dit, "final_layer.video_out.bias", VIDEO_PATCH,
+    dit->final_video_b = f32_1(dit, "final_layer.video_out.bias", VIDEO_PATCH,
                             error, error_size);
-    dit->final_audio_w = f2(dit, "final_layer.audio_out.weight", AUDIO_CHANNELS,
+    dit->final_audio_w = f32_2(dit, "final_layer.audio_out.weight", AUDIO_CHANNELS,
                             HIDDEN, error, error_size);
-    dit->final_audio_b = f1(dit, "final_layer.audio_out.bias", AUDIO_CHANNELS,
+    dit->final_audio_b = f32_1(dit, "final_layer.audio_out.bias", AUDIO_CHANNELS,
                             error, error_size);
     if (dit->bf16_final && dit->final_video_w && dit->final_video_b &&
         dit->final_audio_w && dit->final_audio_b) {
@@ -1323,13 +1604,12 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         h3_gpu_tensor *target[4] = {0};
         int ok = 1;
         for (unsigned index = 0; index < 4; index++) {
-            target[index] = h3_gpu_tensor_new_bf16(dit->gpu,
-                                                    elements[index]);
+            target[index] = h3_gpu_tensor_new(dit->gpu, elements[index], H3_GPU_BF16);
             if (!target[index]) ok = 0;
         }
         if (ok) ok = h3_gpu_begin(dit->gpu);
         for (unsigned index = 0; ok && index < 4; index++)
-            ok = h3_gpu_cast_f32_to_bf16(dit->gpu, target[index],
+            ok = h3_gpu_cast(dit->gpu, target[index],
                                          source[index],
                                          (uint32_t)elements[index]);
         if (ok) ok = h3_gpu_submit(dit->gpu);
@@ -1364,37 +1644,48 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         !getenv("H3_DISABLE_FUSED_PATCH_CAST") && !getenv("H3_SCALAR_PATCH");
     dit->fused_patch_pack = dit->fused_patch_projection &&
         !getenv("H3_DISABLE_FUSED_PATCH_PACK");
-#define BF(field, elements) (dit->field = h3_gpu_tensor_new_bf16(dit->gpu, (elements)))
-#define F32(field, elements) (dit->field = h3_gpu_tensor_new_f32(dit->gpu, (elements)))
-    h3_gpu_tensor *all[] = {
-        F32(video_input, video_total * VIDEO_PATCH),
-        F32(audio_input, audio_total * AUDIO_CHANNELS),
-        BF(hidden, sequence * HIDDEN),
-        BF(mod_attention, sequence * HIDDEN),
-        BF(qkv, sequence * INNER * 3),
-        BF(query, sequence * INNER),
-        BF(key, sequence * INNER),
-        BF(value, sequence * INNER),
-        BF(attention_output, sequence * HIDDEN),
-        F32(final_audio_inverse, audio),
-        F32(final_video_inverse, video),
-        BF(audio_output_bf16, audio * AUDIO_CHANNELS),
-        BF(video_output_bf16, video * VIDEO_PATCH)
-    };
-#undef BF
+#define BF16(field, elements) dit->field = h3_gpu_tensor_new(dit->gpu, (elements), H3_GPU_BF16)
+#define F16(field, elements)  dit->field = h3_gpu_tensor_new(dit->gpu, (elements), H3_GPU_F16)
+#define F32(field, elements)  dit->field = h3_gpu_tensor_new(dit->gpu, (elements), H3_GPU_F32)
+    F32(video_input, video_total * VIDEO_PATCH);
+    F32(audio_input, audio_total * AUDIO_CHANNELS);
+    BF16(hidden, sequence * HIDDEN);
+    BF16(mod_attention, sequence * HIDDEN);
+    if (dit->use_f16_dit) {
+        F16(qkv, sequence * INNER * 3);
+        F16(query, sequence * INNER);
+        F16(key, sequence * INNER);
+        F16(value, sequence * INNER);
+    } else {
+        BF16(qkv, sequence * INNER * 3);
+        BF16(query, sequence * INNER);
+        BF16(key, sequence * INNER);
+        BF16(value, sequence * INNER);
+    }
+    BF16(attention_output, sequence * HIDDEN);
+    F32(final_audio_inverse, audio);
+    F32(final_video_inverse, video);
+    BF16(audio_output_bf16, audio * AUDIO_CHANNELS);
+    BF16(video_output_bf16, video * VIDEO_PATCH);
+#undef BF16
+#undef F16
 #undef F32
-    for (size_t index = 0; index < sizeof(all) / sizeof(*all); index++) {
-        if (!all[index]) {
-            fail(error, error_size, "cannot allocate DiT activation arena: %s",
-                 h3_gpu_error(dit->gpu));
-            return 0;
-        }
+    if (!dit->video_input || !dit->audio_input ||
+        !dit->hidden || !dit->mod_attention ||
+        !dit->qkv || !dit->query ||
+        !dit->key || !dit->value ||
+        !dit->attention_output ||
+        !dit->final_audio_inverse || !dit->final_video_inverse ||
+        !dit->audio_output_bf16 || !dit->video_output_bf16 ) {
+        fail(error, error_size, "cannot allocate DiT activations: %s",
+            h3_gpu_error(dit->gpu));
+        return 0;
     }
     if (!dit->fused_patch_pack) {
-        dit->video_projected = h3_gpu_tensor_new_bf16(
-            dit->gpu, video_total * HIDDEN);
-        dit->audio_projected = h3_gpu_tensor_new_bf16(
-            dit->gpu, audio_total * HIDDEN);
+        dit->video_projected = h3_gpu_tensor_new(
+            dit->gpu, video_total * HIDDEN, H3_GPU_BF16);
+        dit->audio_projected = h3_gpu_tensor_new(
+            dit->gpu, audio_total * HIDDEN, H3_GPU_BF16);
         if (!dit->video_projected || !dit->audio_projected) {
             fail(error, error_size,
                  "cannot allocate packed patch projections: %s",
@@ -1403,10 +1694,10 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         }
     }
     if (!dit->fused_patch_projection) {
-        dit->video_projected_f32 = h3_gpu_tensor_new_f32(
-            dit->gpu, video_total * HIDDEN);
-        dit->audio_projected_f32 = h3_gpu_tensor_new_f32(
-            dit->gpu, audio_total * HIDDEN);
+        dit->video_projected_f32 = h3_gpu_tensor_new(
+            dit->gpu, video_total * HIDDEN, H3_GPU_F32);
+        dit->audio_projected_f32 = h3_gpu_tensor_new(
+            dit->gpu, audio_total * HIDDEN, H3_GPU_F32);
         if (!dit->video_projected_f32 || !dit->audio_projected_f32) {
             fail(error, error_size,
                  "cannot allocate separate patch projections: %s",
@@ -1416,15 +1707,15 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     }
     if (dit->activation_aliases) {
         dit->attention_heads = dit->qkv;
-        dit->mod_mlp = dit->qkv;
+        dit->mod_mlp = dit->mod_attention;
         dit->mlp_output = NULL;
     } else {
-        dit->attention_heads = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * INNER);
-        dit->mod_mlp = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * HIDDEN);
-        dit->mlp_output = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * HIDDEN);
+        dit->attention_heads = h3_gpu_tensor_new(
+            dit->gpu, sequence * INNER, H3_GPU_BF16);
+        dit->mod_mlp = h3_gpu_tensor_new(
+            dit->gpu, sequence * HIDDEN, H3_GPU_BF16);
+        dit->mlp_output = h3_gpu_tensor_new(
+            dit->gpu, sequence * HIDDEN, H3_GPU_BF16);
     }
     if (!dit->attention_heads || !dit->mod_mlp ||
         (!dit->activation_aliases && !dit->mlp_output)) {
@@ -1434,10 +1725,10 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         return 0;
     }
     if (getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
-        dit->final_audio_input = h3_gpu_tensor_new_bf16(
-            dit->gpu, audio * HIDDEN);
-        dit->final_video_input = h3_gpu_tensor_new_bf16(
-            dit->gpu, video * HIDDEN);
+        dit->final_audio_input = h3_gpu_tensor_new(
+            dit->gpu, audio * HIDDEN, H3_GPU_BF16);
+        dit->final_video_input = h3_gpu_tensor_new(
+            dit->gpu, video * HIDDEN, H3_GPU_BF16);
         if (!dit->final_audio_input || !dit->final_video_input) {
             fail(error, error_size,
                  "cannot allocate separate final DiT slices: %s",
@@ -1447,10 +1738,10 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     }
     if (!dit->bf16_final || getenv("H3_DISABLE_FUSED_FINAL_HEAD") ||
         getenv("H3_DISABLE_FUSED_FINAL_SLICE")) {
-        dit->final_audio_norm = h3_gpu_tensor_new_bf16(
-            dit->gpu, audio * HIDDEN);
-        dit->final_video_norm = h3_gpu_tensor_new_bf16(
-            dit->gpu, video * HIDDEN);
+        dit->final_audio_norm = h3_gpu_tensor_new(
+            dit->gpu, audio * HIDDEN, H3_GPU_BF16);
+        dit->final_video_norm = h3_gpu_tensor_new(
+            dit->gpu, video * HIDDEN, H3_GPU_BF16);
         if (!dit->final_audio_norm || !dit->final_video_norm) {
             fail(error, error_size,
                  "cannot allocate separate final DiT normalization: %s",
@@ -1459,14 +1750,14 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         }
     }
     if (!dit->bf16_final) {
-        dit->final_audio_f32 = h3_gpu_tensor_new_f32(
-            dit->gpu, audio * HIDDEN);
-        dit->final_video_f32 = h3_gpu_tensor_new_f32(
-            dit->gpu, video * HIDDEN);
-        dit->audio_output = h3_gpu_tensor_new_f32(
-            dit->gpu, audio * AUDIO_CHANNELS);
-        dit->video_output = h3_gpu_tensor_new_f32(
-            dit->gpu, video * VIDEO_PATCH);
+        dit->final_audio_f32 = h3_gpu_tensor_new(
+            dit->gpu, audio * HIDDEN, H3_GPU_F32);
+        dit->final_video_f32 = h3_gpu_tensor_new(
+            dit->gpu, video * HIDDEN, H3_GPU_F32);
+        dit->audio_output = h3_gpu_tensor_new(
+            dit->gpu, audio * AUDIO_CHANNELS, H3_GPU_F32);
+        dit->video_output = h3_gpu_tensor_new(
+            dit->gpu, video * VIDEO_PATCH, H3_GPU_F32);
         if (!dit->final_audio_f32 || !dit->final_video_f32 ||
             !dit->audio_output || !dit->video_output) {
             fail(error, error_size,
@@ -1476,10 +1767,10 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         }
     }
     if (!dit->fused_mlp) {
-        dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
+        dit->fc1 = h3_gpu_tensor_new(dit->gpu, sequence * FFN * 2, H3_GPU_BF16);
     }
     if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp) {
-        dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
+        dit->activated = h3_gpu_tensor_new(dit->gpu, sequence * FFN, H3_GPU_BF16);
         if ((!dit->fused_mlp && !dit->fc1) || !dit->activated) {
             fail(error, error_size,
                  "cannot allocate diagnostic DiT MLP tensors: %s",
@@ -1489,10 +1780,10 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     }
     if (dit->int8_mlp || dit->int8_qkv || dit->int8_attention_out) {
         size_t padded_sequence = (sequence + 127) & ~(size_t)127;
-        dit->int8_activation = h3_gpu_tensor_new_i8(
-            dit->gpu, padded_sequence * FFN);
-        dit->int8_activation_scales = h3_gpu_tensor_new_f32(
-            dit->gpu, padded_sequence * (FFN / 1024));
+        dit->int8_activation = h3_gpu_tensor_new(
+            dit->gpu, padded_sequence * FFN, H3_GPU_I8);
+        dit->int8_activation_scales = h3_gpu_tensor_new(
+            dit->gpu, padded_sequence * (FFN / 1024), H3_GPU_F32);
         if (!dit->int8_activation || !dit->int8_activation_scales) {
             fail(error, error_size,
                  "cannot allocate int8 DiT activation arena: %s",
@@ -1517,8 +1808,8 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         if (dit->token_original_in_qkv)
             dit->token_original_offset = qkv_used;
         else
-            dit->token_original = h3_gpu_tensor_new_bf16(
-                dit->gpu, full_elements);
+            dit->token_original = h3_gpu_tensor_new(
+                dit->gpu, full_elements, H3_GPU_BF16);
         dit->token_baseline_offset = attention_used;
         if (attention_used > attention_capacity ||
             baseline_elements > attention_capacity - attention_used ||
@@ -1532,10 +1823,10 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         }
     }
     if (dit->core_reuse_interval > 1) {
-        dit->core_input = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * HIDDEN);
-        dit->core_residual = h3_gpu_tensor_new_bf16(
-            dit->gpu, sequence * HIDDEN);
+        dit->core_input = h3_gpu_tensor_new(
+            dit->gpu, sequence * HIDDEN, H3_GPU_BF16);
+        dit->core_residual = h3_gpu_tensor_new(
+            dit->gpu, sequence * HIDDEN, H3_GPU_BF16);
         if (!dit->core_input || !dit->core_residual) {
             fail(error, error_size,
                  "cannot allocate DiT core residual cache: %s",
@@ -1544,6 +1835,33 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         }
     }
     return 1;
+}
+
+static void free_activations(h3_dit *dit) {
+#define FREE(field) free_tensor(&dit->field)
+    if (dit->activation_aliases) {
+        dit->attention_heads = NULL;
+        dit->mod_mlp = NULL;
+    }
+    FREE(video_input); FREE(audio_input);
+    FREE(video_projected_f32); FREE(audio_projected_f32);
+    FREE(video_projected); FREE(audio_projected);
+    //FREE(video_projection_map); FREE(audio_projection_map);
+    FREE(hidden);
+    FREE(core_input); FREE(core_residual);
+    FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
+    FREE(attention_heads); FREE(attention_output);
+    //FREE(token_pool_pairs); FREE(token_baseline_indices); FREE(token_expand_parents);
+    FREE(token_original); FREE(mod_mlp); FREE(fc1);
+    FREE(activated); FREE(mlp_output); FREE(int8_activation);
+    FREE(int8_activation_scales); FREE(final_audio_input);
+    FREE(final_video_input); FREE(final_audio_inverse);
+    FREE(final_video_inverse); FREE(final_audio_norm); FREE(final_video_norm);
+    FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);
+    FREE(video_output);
+    FREE(audio_output_bf16); FREE(video_output_bf16);
+    //FREE(previous_audio_velocity); FREE(previous_video_velocity);
+#undef FREE
 }
 
 typedef struct {
@@ -1577,6 +1895,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_dynamic_fc1_k,
                         int use_slower_grouped_quantizer,
                         int use_int8_row_fc2,
+                        int use_f16_dit,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -1658,6 +1977,7 @@ static h3_dit *load_dit(const char *weight_directory,
          getenv("H3_BENCH_INT8_QKV_AB"));
     dit->use_slower_grouped_quantizer = use_slower_grouped_quantizer;
     dit->use_int8_row_fc2 = dit->int8_mlp && use_int8_row_fc2;
+    dit->use_f16_dit = use_f16_dit;
     dit->keep_bf16_mlp = dit->int8_mlp &&
         (getenv("H3_INT8_KEEP_BF16_MLP") ||
          getenv("H3_BENCH_INT8_MLP_AB") ||
@@ -1719,6 +2039,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         int use_f16_dit,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
@@ -1735,6 +2056,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
                     use_int8_row_fc2,
+                    use_f16_dit,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -1761,6 +2083,7 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         int use_f16_dit,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -1781,6 +2104,7 @@ h3_dit *h3_dit_load_conditioned(
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
                     use_int8_row_fc2,
+                    use_f16_dit,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -1911,11 +2235,18 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->use_slower_uncached_int8_scales),
            "DiT int8 QKV projection/norm/RoPE");
     } else {
-        OP(h3_gpu_grouped_qkv_linear_rope_bf16(
-            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
-            dit->mod_attention, weight->qkv, weight->q_norm, weight->k_norm,
-            rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
-            1e-5f), "DiT QKV projection/norm/RoPE");
+        if (dit->use_f16_dit)
+            OP(h3_gpu_grouped_qkv_linear_rope_f16(
+                dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+                dit->mod_attention, weight->qkv, weight->q_norm, weight->k_norm,
+                rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+                "DiT f16 QKV projection/norm/RoPE");
+        else
+            OP(h3_gpu_grouped_qkv_linear_rope_bf16(
+                dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+                dit->mod_attention, weight->qkv, weight->q_norm, weight->k_norm,
+                rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+                "DiT QKV projection/norm/RoPE");
     }
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
@@ -1923,16 +2254,24 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
-    if (head_major_attention_output)
+    if (head_major_attention_output) {
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-           "DiT head-major full attention");
-    else
-        OP(h3_gpu_sdpa_bf16(
-            dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
-            rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-           "DiT full attention");
+           "DiT int8 head-major full attention");
+    } else {
+        if (dit->use_f16_dit) {
+            OP(h3_gpu_sdpa_f16(
+                dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
+                rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+            "DiT f16 full attention");
+        } else {
+            OP(h3_gpu_sdpa_bf16(
+                dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
+                rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+            "DiT bf16 full attention");
+        }
+    }
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -1948,9 +2287,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 dit->use_slower_uncached_int8_scales),
                "DiT int8 attention output");
     } else {
-        OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
-            dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
-           "DiT attention output");
+        if (dit->use_f16_dit)
+            OP(h3_gpu_linear_f16_scale_64(dit->gpu, dit->attention_output,
+                dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
+               "DiT f16 attention output scale 64");
+        else
+            OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
+                dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
+               "DiT bf16 attention output");
     }
     int fused_int8_mlp_input = dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
@@ -2001,9 +2345,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->mod_mlp, weight->fc1, weight->fc2, rows, HIDDEN, FFN,
             HIDDEN), "DiT NAX fused MLP");
     } else if (dit->fused_mlp) {
-        OP(h3_gpu_mlp_bf16(dit->gpu, mlp_output, dit->mod_mlp,
-            weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
-           "DiT fused MLP");
+        if (dit->use_f16_dit)
+            OP(h3_gpu_mlp_f16_scale_256(dit->gpu, mlp_output, dit->mod_mlp,
+                weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
+            "DiT f16 fused MLP scale 256");
+        else
+            OP(h3_gpu_mlp_bf16(dit->gpu, mlp_output, dit->mod_mlp,
+                weight->fc1, weight->fc2, rows, HIDDEN, FFN, HIDDEN),
+            "DiT bf16 fused MLP");
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
             NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
@@ -2121,10 +2470,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 dit->audio_patch_w, dit->audio_patch_b,
                 dit->audio_total_rows, AUDIO_CHANNELS, HIDDEN),
                "audio patch projection");
-            OP(h3_gpu_cast_f32_to_bf16(
+            OP(h3_gpu_cast(
                 dit->gpu, dit->video_projected, dit->video_projected_f32,
                 dit->video_total_rows * HIDDEN), "video BF16 cast");
-            OP(h3_gpu_cast_f32_to_bf16(
+            OP(h3_gpu_cast(
                 dit->gpu, dit->audio_projected, dit->audio_projected_f32,
                 dit->audio_total_rows * HIDDEN), "audio BF16 cast");
         }
@@ -2371,10 +2720,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             dit->video_rows, HIDDEN, VIDEO_PATCH),
            "BF16 final video head");
     } else if (!dit->bf16_final) {
-        OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_audio_f32,
+        OP(h3_gpu_cast(dit->gpu, dit->final_audio_f32,
             dit->final_audio_norm, dit->audio_rows * HIDDEN),
            "final audio F32 cast");
-        OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->final_video_f32,
+        OP(h3_gpu_cast(dit->gpu, dit->final_video_f32,
             dit->final_video_norm, dit->video_rows * HIDDEN),
            "final video F32 cast");
         OP(h3_gpu_linear_f32(dit->gpu, dit->audio_output,
@@ -2383,10 +2732,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         OP(h3_gpu_linear_f32(dit->gpu, dit->video_output,
             dit->final_video_f32, dit->final_video_w, dit->final_video_b,
             dit->video_rows, HIDDEN, VIDEO_PATCH), "final video head");
-        OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->audio_output_bf16,
+        OP(h3_gpu_cast(dit->gpu, dit->audio_output_bf16,
             dit->audio_output, dit->audio_rows * AUDIO_CHANNELS),
            "final audio output cast");
-        OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->video_output_bf16,
+        OP(h3_gpu_cast(dit->gpu, dit->video_output_bf16,
             dit->video_output, dit->video_rows * VIDEO_PATCH),
            "final video output cast");
     }
@@ -2469,14 +2818,12 @@ int h3_dit_forward(h3_dit *dit, int step,
         video_row_elements) &&
         h3_dit_pack_audio(audio_latent, AUDIO_CHANNELS, dit->audio_t,
                           audio_rows, audio_row_elements) &&
-        h3_gpu_tensor_write_f32_range(
-            dit->video_input,
-            (size_t)dit->video_condition_rows * VIDEO_PATCH,
-            video_rows, video_row_elements) &&
-        h3_gpu_tensor_write_f32_range(
-            dit->audio_input,
-            (size_t)dit->audio_condition_rows * AUDIO_CHANNELS,
-            audio_rows, audio_row_elements);
+        h3_gpu_tensor_write_f32_range(dit->video_input,
+                                      (size_t)dit->video_condition_rows * VIDEO_PATCH,
+                                      video_rows, video_row_elements) &&
+        h3_gpu_tensor_write_f32_range(dit->audio_input,
+                                      (size_t)dit->audio_condition_rows * AUDIO_CHANNELS,
+                                      audio_rows, audio_row_elements);
     if (!ok) fail(error, error_size, "cannot pack/write DiT input latents");
     if (ok) ok = encode_forward(dit, step, 1, 1, 0, error, error_size);
     if (ok) ok = h3_gpu_tensor_read_bf16(dit->video_output_bf16, video_out,
@@ -2593,22 +2940,7 @@ static unsigned gpu_sampler_window(void) {
         ? (unsigned)parsed : 1;
 }
 
-static int ensure_previous_velocities(h3_dit *dit, char *error,
-                                      size_t error_size) {
-    if (dit->previous_video_velocity && dit->previous_audio_velocity) return 1;
-    free_tensor(&dit->previous_video_velocity);
-    free_tensor(&dit->previous_audio_velocity);
-    dit->previous_video_velocity = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)dit->video_rows * VIDEO_PATCH);
-    dit->previous_audio_velocity = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)dit->audio_rows * AUDIO_CHANNELS);
-    if (dit->previous_video_velocity && dit->previous_audio_velocity) return 1;
-    free_tensor(&dit->previous_video_velocity);
-    free_tensor(&dit->previous_audio_velocity);
-    fail(error, error_size, "cannot allocate GPU Euler velocity cache: %s",
-         h3_gpu_error(dit->gpu));
-    return 0;
-}
+
 
 static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                              float *audio_latent, int reuse_interval,
@@ -2647,12 +2979,12 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
         video_offset > UINT32_MAX - video_count ||
         audio_offset > UINT32_MAX - audio_count ||
         (reuse_interval > 1 &&
-         !ensure_previous_velocities(dit, error, error_size))) return 0;
+         !prepare_previous_velocities(dit, error, error_size))) return 0;
 
     float *video_rows = malloc(video_count * sizeof(*video_rows));
     float *audio_rows = malloc(audio_count * sizeof(*audio_rows));
     h3_gpu_tensor *x0_scratch = preview && preview_mode == H3_PREVIEW_ESTIMATE
-        ? h3_gpu_tensor_new_f32(dit->gpu, video_count) : NULL;
+        ? h3_gpu_tensor_new(dit->gpu, video_count, H3_GPU_F32) : NULL;
     if (!video_rows || !audio_rows ||
         (preview && preview_mode == H3_PREVIEW_ESTIMATE && !x0_scratch)) {
         fail(error, error_size, "out of memory packing GPU Euler latents");
@@ -2837,8 +3169,9 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
         !audio_denoised || !old_video || !old_audio || !video_next ||
         !audio_next) {
         fail(error, error_size, "out of memory allocating RES solver state");
-        free(video_velocity); free(audio_velocity); free(video_denoised);
-        free(audio_denoised); free(old_video); free(old_audio);
+        free(video_velocity); free(audio_velocity);
+        free(video_denoised); free(audio_denoised);
+        free(old_video); free(old_audio);
         free(video_next); free(audio_next);
         return 0;
     }
@@ -2877,12 +3210,12 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
                    video_count * sizeof(*old_video));
             memcpy(old_audio, audio_denoised,
                    audio_count * sizeof(*old_audio));
-            report(progress, progress_opaque, "denoise", step + 1,
-                   dit->sigmas.steps);
         }
     }
-    free(video_velocity); free(audio_velocity); free(video_denoised);
-    free(audio_denoised); free(old_video); free(old_audio);
+    if (ok) report(progress, progress_opaque, "denoise", dit->sigmas.steps, dit->sigmas.steps);
+    free(video_velocity); free(audio_velocity);
+    free(video_denoised); free(audio_denoised);
+    free(old_video); free(old_audio);
     free(video_next); free(audio_next);
     h3_gpu_profile_mark(dit->gpu, "RES denoise");
     return ok;
@@ -2939,12 +3272,9 @@ int h3_dit_denoise_euler_preview(
         (reuse_interval > 1 &&
          (!last_video || !previous_video || !last_audio || !previous_audio))) {
         fail(error, error_size, "out of memory allocating Euler velocities");
-        free(video_velocity);
-        free(audio_velocity);
-        free(last_video);
-        free(previous_video);
-        free(last_audio);
-        free(previous_audio);
+        free(video_velocity); free(audio_velocity);
+        free(last_video); free(last_audio);
+        free(previous_video); free(previous_audio);
         return 0;
     }
     int ok = 1;
@@ -3025,12 +3355,9 @@ int h3_dit_denoise_euler_preview(
         if (ok) report(progress, progress_opaque, "denoise", step + 1,
                        dit->sigmas.steps);
     }
-    free(video_velocity);
-    free(audio_velocity);
-    free(last_video);
-    free(previous_video);
-    free(last_audio);
-    free(previous_audio);
+    free(video_velocity); free(audio_velocity);
+    free(last_video); free(last_audio);
+    free(previous_video); free(previous_audio);
     h3_gpu_profile_mark(dit->gpu, "Euler denoise");
     return ok;
 }
@@ -3046,56 +3373,27 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
-    int steps = h3_dit_schedule_steps(dit->schedule);
-    if (dit->row_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->row_maps[step]);
-    if (dit->reduced_row_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->reduced_row_maps[step]);
-    if (dit->final_audio_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->final_audio_maps[step]);
-    if (dit->final_video_maps) for (int step = 0; step < steps; step++)
-        h3_gpu_tensor_free(dit->final_video_maps[step]);
-    free(dit->row_maps);
-    free(dit->reduced_row_maps);
-    free(dit->final_audio_maps);
-    free(dit->final_video_maps);
-    free_tensor(&dit->refined_text);
-    free_tensor(&dit->rope_cos);
-    free_tensor(&dit->rope_sin);
-    free_tensor(&dit->reduced_rope_cos);
-    free_tensor(&dit->reduced_rope_sin);
+
     free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
     free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
         free_block(&dit->blocks[block]);
-    free_block(&dit->stream_slots[0]);
-    free_block(&dit->stream_slots[1]);
     free_tensor(&dit->final_norm);
     free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
     free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
-#define FREE(field) free_tensor(&dit->field)
-    if (dit->activation_aliases) {
-        dit->attention_heads = NULL;
-        dit->mod_mlp = NULL;
-    }
-    FREE(video_input); FREE(audio_input);
-    FREE(video_projected_f32); FREE(audio_projected_f32);
-    FREE(video_projected); FREE(audio_projected);
-    FREE(video_projection_map); FREE(audio_projection_map); FREE(hidden);
-    FREE(core_input); FREE(core_residual);
-    FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
-    FREE(attention_heads); FREE(attention_output);
-    FREE(token_pool_pairs); FREE(token_baseline_indices);
-    FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
-    FREE(activated); FREE(mlp_output); FREE(int8_activation);
-    FREE(int8_activation_scales); FREE(final_audio_input);
-    FREE(final_video_input); FREE(final_audio_inverse);
-    FREE(final_video_inverse); FREE(final_audio_norm); FREE(final_video_norm);
-    FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);
-    FREE(video_output);
-    FREE(audio_output_bf16); FREE(video_output_bf16);
-    FREE(previous_audio_velocity); FREE(previous_video_velocity);
-#undef FREE
+
+    free_tensor(&dit->refined_text);
+
+    free_block(&dit->stream_slots[0]);
+    free_block(&dit->stream_slots[1]);
+
+    free_rope(dit);
+    free_maps(dit);
+    free_projection_maps(dit);
+    free_token_reduction_maps(dit);
+    free_previous_velocities(dit);
+    free_activations(dit);
+
     h3_dit_schedule_free(dit->schedule);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
@@ -3126,9 +3424,9 @@ static int video_shape(int channels, int time, int height, int width,
     return 1;
 }
 
-int h3_dit_patchify_video(const float *latent, int channels, int time,
-                          int height, int width, float *rows,
-                          size_t row_elements) {
+int h3_dit_patchify_video(const float *latent,
+                          int channels, int time, int height, int width,
+                          float *rows, size_t row_elements) {
     size_t latent_count, expected;
     if (!latent || !rows ||
         !video_shape(channels, time, height, width, &latent_count, &expected) ||
@@ -3148,9 +3446,9 @@ int h3_dit_patchify_video(const float *latent, int channels, int time,
     return output == row_elements;
 }
 
-int h3_dit_unpatchify_video(const float *rows, int channels, int time,
-                            int height, int width, float *latent,
-                            size_t latent_elements) {
+int h3_dit_unpatchify_video(const float *rows,
+                            int channels, int time, int height, int width,
+                            float *latent, size_t latent_elements) {
     size_t expected, row_count;
     if (!rows || !latent ||
         !video_shape(channels, time, height, width, &expected, &row_count) ||

@@ -1,5 +1,6 @@
 #include "h3_video_vae.h"
 
+#include "h3_gpu.h"
 #include "h3_weights.h"
 
 #include <errno.h>
@@ -340,7 +341,7 @@ static int prepare_input(vae_context *vae, const float *input,
                                   mean[channel];
                 }
     }
-    vae->latent = h3_gpu_tensor_from_f32(vae->gpu, rows, patch_elements);
+    vae->latent = h3_gpu_tensor_load(vae->gpu, rows, patch_elements, H3_GPU_F32);
     free(rows);
     return vae->latent != NULL;
 }
@@ -383,8 +384,8 @@ static int prepare_rope(vae_context *vae, char *error, size_t error_size) {
         }
         row++;
     }
-    vae->rope_cos = h3_gpu_tensor_from_f32(vae->gpu, cosines, count);
-    vae->rope_sin = h3_gpu_tensor_from_f32(vae->gpu, sines, count);
+    vae->rope_cos = h3_gpu_tensor_load(vae->gpu, cosines, count, H3_GPU_F32);
+    vae->rope_sin = h3_gpu_tensor_load(vae->gpu, sines, count, H3_GPU_F32);
     free(cosines); free(sines);
     if (!vae->rope_cos || !vae->rope_sin) {
         fail(error, error_size, "cannot allocate video VAE RoPE: %s",
@@ -397,7 +398,7 @@ static int prepare_rope(vae_context *vae, char *error, size_t error_size) {
 static int allocate_activations(vae_context *vae, char *error,
                                 size_t error_size) {
     size_t patches = vae->patches, sequence = vae->sequence;
-#define F32(field, elements) (vae->field = h3_gpu_tensor_new_f32(vae->gpu, (elements)))
+#define F32(field, elements) (vae->field = h3_gpu_tensor_new(vae->gpu, (elements), H3_GPU_F32))
     h3_gpu_tensor *all[] = {
         F32(post, patches * LATENT_CHANNELS),
         F32(patch_hidden, patches * HIDDEN),
@@ -458,9 +459,8 @@ static int run_block(vae_context *vae, int index, char *error,
 static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
                        void *progress_opaque, char *error,
                        size_t error_size) {
-    float zeros[HIDDEN];
-    memset(zeros, 0, sizeof(zeros));
-    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
+    h3_gpu_tensor *zero = h3_gpu_tensor_new(vae->gpu, HIDDEN, H3_GPU_F32);
+    h3_gpu_zero(vae->gpu, zero, HIDDEN, sizeof(float));
     if (!zero) {
         fail(error, error_size, "cannot allocate video VAE suffix token");
         return 0;
@@ -534,7 +534,7 @@ static int run_resident_tile(vae_context *vae, char *error,
                              size_t error_size) {
     float zeros[HIDDEN];
     memset(zeros, 0, sizeof(zeros));
-    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
+    h3_gpu_tensor *zero = h3_gpu_tensor_load(vae->gpu, zeros, HIDDEN, H3_GPU_F32);
     if (!zero) {
         fail(error, error_size, "cannot allocate video VAE suffix token");
         return 0;
@@ -1307,13 +1307,13 @@ int h3_video_vae_decode(const char *weight_directory,
                                    error, error_size)) return 0;
     int tile_pixels = configured_tile_pixels(
         latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
-    if (latent_time == 2 &&
+    /*if (latent_time == 2 &&
         (latent_height > TILE_PIXELS / SPATIAL_RATIO ||
          latent_width > TILE_PIXELS / SPATIAL_RATIO)) {
         fail(error, error_size,
              "the two-token diagnostic VAE path supports one spatial tile");
         return 0;
-    }
+        }*/
     if (latent_time > CHUNK_LATENT_TIME ||
         latent_height > tile_pixels / SPATIAL_RATIO ||
         latent_width > tile_pixels / SPATIAL_RATIO) {

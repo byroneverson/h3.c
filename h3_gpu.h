@@ -11,7 +11,8 @@ typedef enum {
     H3_GPU_F32 = 0,
     H3_GPU_BF16,
     H3_GPU_I8,
-    H3_GPU_U32
+    H3_GPU_U32,
+    H3_GPU_F16,
 } h3_gpu_dtype;
 
 typedef struct {
@@ -39,15 +40,9 @@ int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
 
-h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
-h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
-h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements);
-h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
-                                      size_t elements);
-h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
-                                       size_t elements);
-h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
-                                      size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load(h3_gpu *gpu, const void *values, size_t elements, h3_gpu_dtype dtype);
+h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *gpu, size_t elements, h3_gpu_dtype dtype);
+
 /* Allocate shared Metal storage and pread BF16 payload directly into it. */
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
@@ -124,10 +119,8 @@ int h3_gpu_patch_linear_bf16_map(
                              uint32_t input_dim, uint32_t output_dim);
 int h3_gpu_silu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input, uint32_t elements);
-int h3_gpu_cast_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
-                            const h3_gpu_tensor *input, uint32_t elements);
-int h3_gpu_cast_bf16_to_f32(h3_gpu *gpu, h3_gpu_tensor *output,
-                            const h3_gpu_tensor *input, uint32_t elements);
+int h3_gpu_cast(h3_gpu *gpu, h3_gpu_tensor *output,
+                const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_copy_bf16(h3_gpu *gpu, h3_gpu_tensor *destination,
                      size_t destination_offset,
                      const h3_gpu_tensor *source, size_t source_offset,
@@ -609,5 +602,55 @@ int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
 int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);
+
+int h3_gpu_zero(h3_gpu *gpu, h3_gpu_tensor *inout, size_t elements, size_t item_size);
+
+h3_gpu_tensor *h3_gpu_tensor_from_f32_nocopy(h3_gpu *gpu, const void *values, size_t elements);
+
+int h3_gpu_cast_bf16_to_f16_inplace(h3_gpu *opaque, h3_gpu_tensor *inout, uint32_t elements);
+
+int h3_gpu_rms_norm_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *input,
+                         const h3_gpu_tensor *weight, uint32_t rows,
+                         uint32_t width, float epsilon);
+
+int h3_gpu_grouped_qkv_linear_rope_f16(
+                                 h3_gpu *gpu,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *qkv,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon);
+
+int h3_gpu_sdpa_f16(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                    const h3_gpu_tensor *value, uint32_t sequence,
+                    uint32_t heads, uint32_t head_dim, float scale);
+
+int h3_gpu_linear_f16_scale_64(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *weight,
+                    const h3_gpu_tensor *bias, uint32_t rows,
+                    uint32_t input_dim, uint32_t output_dim);
+
+int h3_gpu_mlp_f16_scale_256(h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *fc1_weight, const h3_gpu_tensor *fc2_weight,
+                    uint32_t rows, uint32_t input_dim, uint32_t hidden_dim, uint32_t output_dim);
+
+int h3_gpu_lora_bf16(h3_gpu *gpu, h3_gpu_tensor *inout,
+                    const h3_gpu_tensor *lora_b, const h3_gpu_tensor *lora_a,
+                    uint32_t output_dim, uint32_t rank, uint32_t input_dim);
+
+int h3_gpu_lora_f16(h3_gpu *gpu, h3_gpu_tensor *inout,
+                    const h3_gpu_tensor *lora_b, const h3_gpu_tensor *lora_a,
+                    uint32_t output_dim, uint32_t rank, uint32_t input_dim);
 
 #endif

@@ -389,12 +389,12 @@ static h3_gpu_tensor *run_conv(encoder_context *encoder,
     h3_gpu_tensor *padded = NULL;
     if (conv->depth_front || conv->height_before || conv->height_after ||
         conv->width_before || conv->width_after)
-        padded = h3_gpu_tensor_new_f32(
+        padded = h3_gpu_tensor_new(
             encoder->gpu, tensor_elements(padded_d, padded_h, padded_w,
-                                           conv->input_channels));
-    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(
+                                           conv->input_channels), H3_GPU_F32);
+    h3_gpu_tensor *output = h3_gpu_tensor_new(
         encoder->gpu, tensor_elements(*output_depth, *output_height,
-                                      *output_width, conv->output_channels));
+                                      *output_width, conv->output_channels), H3_GPU_F32);
     int ok = output && (!((conv->depth_front || conv->height_before ||
                            conv->height_after || conv->width_before ||
                            conv->width_after)) || padded);
@@ -429,14 +429,14 @@ static h3_gpu_tensor *run_block(encoder_context *encoder,
                                         input_channels);
     size_t pad2_count = tensor_elements(depth + 2, height + 2, width + 2,
                                         output_channels);
-    h3_gpu_tensor *norm1 = h3_gpu_tensor_new_f32(encoder->gpu, input_count);
-    h3_gpu_tensor *pad1 = h3_gpu_tensor_new_f32(encoder->gpu, pad1_count);
-    h3_gpu_tensor *hidden = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
-    h3_gpu_tensor *norm2 = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
-    h3_gpu_tensor *pad2 = h3_gpu_tensor_new_f32(encoder->gpu, pad2_count);
-    h3_gpu_tensor *output = h3_gpu_tensor_new_f32(encoder->gpu, output_count);
+    h3_gpu_tensor *norm1 = h3_gpu_tensor_new(encoder->gpu, input_count, H3_GPU_F32);
+    h3_gpu_tensor *pad1 = h3_gpu_tensor_new(encoder->gpu, pad1_count, H3_GPU_F32);
+    h3_gpu_tensor *hidden = h3_gpu_tensor_new(encoder->gpu, output_count, H3_GPU_F32);
+    h3_gpu_tensor *norm2 = h3_gpu_tensor_new(encoder->gpu, output_count, H3_GPU_F32);
+    h3_gpu_tensor *pad2 = h3_gpu_tensor_new(encoder->gpu, pad2_count, H3_GPU_F32);
+    h3_gpu_tensor *output = h3_gpu_tensor_new(encoder->gpu, output_count, H3_GPU_F32);
     h3_gpu_tensor *shortcut = block->has_shortcut ?
-        h3_gpu_tensor_new_f32(encoder->gpu, output_count) : NULL;
+        h3_gpu_tensor_new(encoder->gpu, output_count, H3_GPU_F32) : NULL;
     int ok = norm1 && pad1 && hidden && norm2 && pad2 && output &&
              (!block->has_shortcut || shortcut);
     if (!ok) {
@@ -505,8 +505,8 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
                     normalized[destination++] =
                         (pixels[source] - mean[channel]) / deviation[channel];
                 }
-    h3_gpu_tensor *hidden = h3_gpu_tensor_from_f32(
-        encoder->gpu, normalized, pixel_count);
+    h3_gpu_tensor *hidden = h3_gpu_tensor_load(
+        encoder->gpu, normalized, pixel_count, H3_GPU_F32);
     free(normalized);
     if (!hidden) {
         fail(error, error_size, "cannot allocate visual encoder pixels");
@@ -547,10 +547,10 @@ static float *encode_tile(encoder_context *encoder, const float *pixels,
     size_t hidden_count = tensor_elements(depth, h, w, 1024);
     size_t padded_count = tensor_elements(depth + 2, h + 2, w + 2, 1024);
     size_t moment_count = tensor_elements(depth, h, w, MOMENT_CHANNELS);
-    h3_gpu_tensor *norm = h3_gpu_tensor_new_f32(encoder->gpu, hidden_count);
-    h3_gpu_tensor *padded = h3_gpu_tensor_new_f32(encoder->gpu, padded_count);
-    h3_gpu_tensor *moments = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
-    h3_gpu_tensor *quant = h3_gpu_tensor_new_f32(encoder->gpu, moment_count);
+    h3_gpu_tensor *norm = h3_gpu_tensor_new(encoder->gpu, hidden_count, H3_GPU_F32);
+    h3_gpu_tensor *padded = h3_gpu_tensor_new(encoder->gpu, padded_count, H3_GPU_F32);
+    h3_gpu_tensor *moments = h3_gpu_tensor_new(encoder->gpu, moment_count, H3_GPU_F32);
+    h3_gpu_tensor *quant = h3_gpu_tensor_new(encoder->gpu, moment_count, H3_GPU_F32);
     int ok = norm && padded && moments && quant;
     if (!ok) {
         fail(error, error_size, "cannot allocate visual encoder output");
