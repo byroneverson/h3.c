@@ -28,6 +28,8 @@ typedef struct {
     const uint16_t *deepstack[3];
 } h3_text_vision_span;
 
+void h3_text_init_arch(int text_enc_size, const char *text_enc_adapter);
+
 /* Run the released first 50 Qwen3-VL language layers. The caller owns the
  * returned BF16 values and releases them with h3_text_embedding_free(). */
 int h3_text_encode_bf16(const char *weight_directory,

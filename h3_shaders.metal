@@ -4331,6 +4331,42 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
 
+kernel void h3_gpu_standardize_f32(
+            device const float *input [[buffer(0)]],
+            device const float *mean  [[buffer(1)]],
+            device const float *std   [[buffer(2)]],
+            device float *output      [[buffer(3)]],
+            constant uint &count       [[buffer(4)]],
+            constant uint &feature_dim [[buffer(5)]],
+            constant uint &inner_dim   [[buffer(6)]],
+            uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    uint f = (gid / inner_dim) % feature_dim;
+    float val = input[gid];
+    float m   = mean[f];
+    float s   = std[f];
+    float out = (val - m) / s; // (s + 1e-8f);
+    output[gid] = out;
+}
+
+kernel void h3_gpu_unstandardize_f32(
+            device const float *input [[buffer(0)]],
+            device const float *mean  [[buffer(1)]],
+            device const float *std   [[buffer(2)]],
+            device float *output      [[buffer(3)]],
+            constant uint &count       [[buffer(4)]],
+            constant uint &feature_dim [[buffer(5)]],
+            constant uint &inner_dim   [[buffer(6)]],
+            uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    uint f = (gid / inner_dim) % feature_dim;
+    float val = input[gid];
+    float m   = mean[f];
+    float s   = std[f];
+    float out = (val * s) + m;
+    output[gid] = out;
+}
+
 inline half h3_bf16_to_f16(ushort value) {
     return half(as_type<float>(uint(value) << 16));
 }

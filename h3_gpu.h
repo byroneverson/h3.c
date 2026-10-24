@@ -603,6 +603,15 @@ int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);
 
+int h3_gpu_standardize_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *mean, const h3_gpu_tensor *std,
+                    uint32_t elements, uint32_t feature_dim, uint32_t inner_dim);
+int h3_gpu_unstandardize_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *mean, const h3_gpu_tensor *std,
+                    uint32_t elements, uint32_t feature_dim, uint32_t inner_dim);
+
 int h3_gpu_zero(h3_gpu *gpu, h3_gpu_tensor *inout, size_t elements, size_t item_size);
 
 h3_gpu_tensor *h3_gpu_tensor_from_f32_nocopy(h3_gpu *gpu, const void *values, size_t elements);

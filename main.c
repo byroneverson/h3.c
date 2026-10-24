@@ -63,6 +63,8 @@ static void usage(const char *program) {
         "      --preview-mode M   Preview reconstruction: raw (default, shows the\n"
         "                         literal noisy sample) or estimate (reconstructs\n"
         "                         the estimated clean sample, sharpens earlier)\n"
+        "      --use-text-encoder S  Text encoder size: 32b (default), 8b, or 4b\n"
+        "      --use-text-encoder-adapter PATH  Path of text encoder adapter directory\n"
         "      --use-f16-dit      Use f16 for dit blocks (Amduraznak's fix modified for M1)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
@@ -259,6 +261,8 @@ int main(int argc, char **argv) {
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
            OPT_PREVIEW_FRAMES, OPT_PREVIEW_MODE,
+           OPT_TEXT_ENC_SIZE,
+           OPT_TEXT_ENC_ADAPTER,
            OPT_USE_F16_DIT,
            OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
@@ -313,6 +317,8 @@ int main(int argc, char **argv) {
         {"zoom", required_argument, NULL, OPT_ZOOM},
         {"preview-frames", required_argument, NULL, OPT_PREVIEW_FRAMES},
         {"preview-mode", required_argument, NULL, OPT_PREVIEW_MODE},
+        {"use-text-encoder", required_argument, NULL, OPT_TEXT_ENC_SIZE},
+        {"use-text-encoder-adapter", required_argument, NULL, OPT_TEXT_ENC_ADAPTER},
         {"use-f16-dit", no_argument, NULL, OPT_USE_F16_DIT},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
@@ -485,6 +491,19 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
+            case OPT_TEXT_ENC_SIZE:
+                if (!strcasecmp(optarg, "8b")) {
+                    params.text_enc_size = H3_TEXT_ENC_8B;
+                } else if (!strcasecmp(optarg, "4b")) {
+                    params.text_enc_size = H3_TEXT_ENC_4B;
+                } else if (!strcasecmp(optarg, "32b")) {
+                    params.text_enc_size = H3_TEXT_ENC_32B;
+                } else {
+                    fprintf(stderr, "h3: --text-encoder must be 4b, 8b, or 32b\n");
+                    return 2;
+                }
+                break;
+            case OPT_TEXT_ENC_ADAPTER: params.text_enc_adapter = optarg; break;
             case OPT_USE_F16_DIT:
                 params.use_f16_dit = 1;
                 break;

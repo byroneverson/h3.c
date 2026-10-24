@@ -4687,6 +4687,48 @@ int h3_gpu_silu_mul_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         });
 }
 
+int h3_gpu_standardize_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *mean, const h3_gpu_tensor *std,
+                    uint32_t elements, uint32_t feature_dim, uint32_t inner_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_f32(gpu, input, elements, @"input") ||
+        !h3_gpu_require_f32(gpu, mean, feature_dim, @"mean") ||
+        !h3_gpu_require_f32(gpu, std, feature_dim, @"std") ||
+        !h3_gpu_require_f32(gpu, output, elements, @"output")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_gpu_standardize_f32", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(mean).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(std).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:4];
+            [encoder setBytes:&feature_dim length:sizeof(feature_dim) atIndex:5];
+            [encoder setBytes:&inner_dim length:sizeof(inner_dim) atIndex:6];
+        });
+}
+
+int h3_gpu_unstandardize_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input,
+                    const h3_gpu_tensor *mean, const h3_gpu_tensor *std,
+                    uint32_t elements, uint32_t feature_dim, uint32_t inner_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_f32(gpu, input, elements, @"input") ||
+        !h3_gpu_require_f32(gpu, mean, feature_dim, @"mean") ||
+        !h3_gpu_require_f32(gpu, std, feature_dim, @"std") ||
+        !h3_gpu_require_f32(gpu, output, elements, @"output")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_gpu_unstandardize_f32", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(mean).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(std).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:4];
+            [encoder setBytes:&feature_dim length:sizeof(feature_dim) atIndex:5];
+            [encoder setBytes:&inner_dim length:sizeof(inner_dim) atIndex:6];
+        });
+}
+
 int h3_gpu_zero(h3_gpu *opaque, h3_gpu_tensor *inout, size_t elements, size_t item_size) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu || elements > SIZE_MAX / item_size) return 0;

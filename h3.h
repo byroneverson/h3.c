@@ -132,6 +132,8 @@ typedef struct {
      * the estimated clean sample x0 = x_t + sigma_t * v, which trends toward
      * a blurry-then-sharpening preview instead. */
     int preview_mode;
+    int text_enc_size;
+    const char *text_enc_adapter;
     int use_f16_dit;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
@@ -143,10 +145,17 @@ enum {
     H3_PREVIEW_ESTIMATE = 1,
 };
 
+enum {
+    H3_TEXT_ENC_32B = 0,
+    H3_TEXT_ENC_8B,
+    H3_TEXT_ENC_4B
+};
+
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, H3_PREVIEW_RAW, \
+    H3_TEXT_ENC_32B, NULL, \
     0, \
     NULL, NULL, NULL \
 }

@@ -1003,6 +1003,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     size_t condition_audio_elements = 0;
     h3_text_embedding text;
     memset(&text, 0, sizeof(text));
+    h3_text_init_arch(params->text_enc_size, params->text_enc_adapter);
     h3_layout layout;
     memset(&layout, 0, sizeof(layout));
     h3_dit *dit = NULL;
@@ -1027,6 +1028,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
     char *text_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/text_encoder" : "FL2VA/text_encoder");
+    if (params->text_enc_size == H3_TEXT_ENC_8B)
+        text_path = h3_path(ctx->model_dir, ref2va ?
+            "Ref2VA/text_encoder_8b" : "FL2VA/text_encoder_8b");
+    else if (params->text_enc_size == H3_TEXT_ENC_4B)
+        text_path = h3_path(ctx->model_dir, ref2va ?
+            "Ref2VA/text_encoder_4b" : "FL2VA/text_encoder_4b");
     char *dit_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/transformer" : "FL2VA/transformer");
     char *vae_path = h3_path(ctx->model_dir, ref2va ?

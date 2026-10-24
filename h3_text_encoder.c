@@ -1,5 +1,6 @@
 #include "h3_text_encoder.h"
 
+#include "h3_gpu.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -9,19 +10,59 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum {
-    TEXT_LAYERS = 50,
-    TEXT_VOCAB = 151936,
-    TEXT_HIDDEN = 5120,
-    TEXT_INTERMEDIATE = 25600,
-    TEXT_QUERY_HEADS = 64,
-    TEXT_KV_HEADS = 8,
-    TEXT_HEAD_DIM = 128,
-    TEXT_QUERY_DIM = TEXT_QUERY_HEADS * TEXT_HEAD_DIM,
-    TEXT_KV_DIM = TEXT_KV_HEADS * TEXT_HEAD_DIM,
-    TEXT_ROPE_HALF = TEXT_HEAD_DIM / 2,
-    TEXT_DEFERRED_WEIGHTS = 1 + TEXT_LAYERS * 11
+#define MAX_TEXT_LAYERS 50
+#define MAX_TEXT_DEFERRED_WEIGHTS (1 + (MAX_TEXT_LAYERS * 11))
+
+typedef struct {
+    int layers;
+    uint32_t vocab;
+    int hidden;
+    int intermediate;
+    int query_heads;
+    int kv_heads;
+    int head_dim;
+    int query_dim;
+    int kv_dim;
+    size_t rope_half;
+    size_t deferred_weights;
+} text_enc_arch;
+
+static text_enc_arch TE = {
+    .layers = 50,
+    .vocab = 151936,
+    .hidden = 5120,
+    .intermediate = 25600,
+    .query_heads = 64,
+    .kv_heads = 8,
+    .head_dim = 128,
+    .query_dim = 64 * 128,
+    .kv_dim = 8 * 128,
+    .rope_half = 64,
+    .deferred_weights = 1 + (50 * 11)
 };
+
+typedef struct {
+    h3_gpu_tensor *mean_in;
+    h3_gpu_tensor *std_in;
+
+    h3_gpu_tensor *weight;
+    h3_gpu_tensor *sink_out;
+
+    /*
+    h3_gpu_tensor *mlp_up_weight;
+    h3_gpu_tensor *mlp_up_bias;
+
+    h3_gpu_tensor *mlp_down_weight;
+    h3_gpu_tensor *mlp_down_bias;
+    */
+
+    h3_gpu_tensor *std_out;
+    h3_gpu_tensor *mean_out;
+} text_enc_adapter;
+
+static int TE_SIZE = H3_TEXT_ENC_32B;
+static const char *TE_ADAPTER = NULL;
+//static int TE_ADAPTER_INTERMEDIATE = 32768;
 
 static const float TEXT_RMS_EPSILON = 1e-6f;
 static const float TEXT_ROPE_THETA = 5000000.0f;
@@ -52,7 +93,7 @@ typedef struct {
 typedef struct {
     const h3_weight_store *store;
     h3_gpu *gpu;
-    h3_gpu_tensor *deferred[TEXT_DEFERRED_WEIGHTS];
+    h3_gpu_tensor *deferred[MAX_TEXT_DEFERRED_WEIGHTS];
     size_t deferred_count;
     char *error;
     size_t error_size;
@@ -90,7 +131,7 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
 
 static h3_gpu_tensor *defer(load_context *load, h3_gpu_tensor *tensor) {
     if (!tensor) return NULL;
-    if (load->deferred_count >= TEXT_DEFERRED_WEIGHTS) {
+    if (load->deferred_count >= TE.deferred_weights) {
         fail(load->error, load->error_size, "Qwen deferred weight registry overflow");
         h3_gpu_tensor_free(tensor);
         return NULL;
@@ -142,6 +183,23 @@ static int text_prefetch_depth(const h3_gpu *gpu) {
     return (int)depth;
 }
 
+void h3_text_init_arch(int text_enc_size, const char *text_enc_adapter) {
+    TE_SIZE = text_enc_size;
+    TE_ADAPTER = text_enc_adapter;
+    if (text_enc_size == H3_TEXT_ENC_4B) {
+        TE = (text_enc_arch){.layers = 24, .hidden = 2560, .intermediate = 9728, .query_heads = 32, .kv_heads = 8, .head_dim = 128};
+    } else if (text_enc_size == H3_TEXT_ENC_8B) {
+        TE = (text_enc_arch){.layers = 24, .hidden = 4096, .intermediate = 12288, .query_heads = 32, .kv_heads = 8, .head_dim = 128};
+    } else { // H3_TEXT_ENC_32B
+        TE = (text_enc_arch){.layers = 50, .hidden = 5120, .intermediate = 25600, .query_heads = 64, .kv_heads = 8, .head_dim = 128};
+    }
+    TE.vocab = 151936;
+    TE.query_dim = TE.query_heads * TE.head_dim;
+    TE.kv_dim = TE.kv_heads * TE.head_dim;
+    TE.rope_half = TE.head_dim / 2;
+    TE.deferred_weights = 1 + TE.layers * 11;
+}
+
 static int layer_weights_load(load_context *load, int layer,
                               text_layer_weights *weights) {
     char prefix[96];
@@ -163,18 +221,18 @@ static int layer_weights_load(load_context *load, int layer,
     weights->field = load_2d(load, name, rows, columns);                        \
     if (!weights->field) return 0;                                              \
 } while (0)
-    LOAD_1D(input_norm, "input_layernorm.weight", TEXT_HIDDEN);
-    LOAD_2D(query, "self_attn.q_proj.weight", TEXT_QUERY_DIM, TEXT_HIDDEN);
-    LOAD_2D(key, "self_attn.k_proj.weight", TEXT_KV_DIM, TEXT_HIDDEN);
-    LOAD_2D(value, "self_attn.v_proj.weight", TEXT_KV_DIM, TEXT_HIDDEN);
-    LOAD_1D(query_norm, "self_attn.q_norm.weight", TEXT_HEAD_DIM);
-    LOAD_1D(key_norm, "self_attn.k_norm.weight", TEXT_HEAD_DIM);
-    LOAD_2D(attention_output, "self_attn.o_proj.weight", TEXT_HIDDEN,
-            TEXT_QUERY_DIM);
-    LOAD_1D(post_norm, "post_attention_layernorm.weight", TEXT_HIDDEN);
-    LOAD_2D(gate, "mlp.gate_proj.weight", TEXT_INTERMEDIATE, TEXT_HIDDEN);
-    LOAD_2D(up, "mlp.up_proj.weight", TEXT_INTERMEDIATE, TEXT_HIDDEN);
-    LOAD_2D(down, "mlp.down_proj.weight", TEXT_HIDDEN, TEXT_INTERMEDIATE);
+    LOAD_1D(input_norm, "input_layernorm.weight", TE.hidden);
+    LOAD_2D(query, "self_attn.q_proj.weight", TE.query_dim, TE.hidden);
+    LOAD_2D(key, "self_attn.k_proj.weight", TE.kv_dim, TE.hidden);
+    LOAD_2D(value, "self_attn.v_proj.weight", TE.kv_dim, TE.hidden);
+    LOAD_1D(query_norm, "self_attn.q_norm.weight", TE.head_dim);
+    LOAD_1D(key_norm, "self_attn.k_norm.weight", TE.head_dim);
+    LOAD_2D(attention_output, "self_attn.o_proj.weight", TE.hidden,
+            TE.query_dim);
+    LOAD_1D(post_norm, "post_attention_layernorm.weight", TE.hidden);
+    LOAD_2D(gate, "mlp.gate_proj.weight", TE.intermediate, TE.hidden);
+    LOAD_2D(up, "mlp.up_proj.weight", TE.intermediate, TE.hidden);
+    LOAD_2D(down, "mlp.down_proj.weight", TE.hidden, TE.intermediate);
 #undef LOAD_1D
 #undef LOAD_2D
     return 1;
@@ -197,17 +255,17 @@ static int layer_weights_allocate(load_context *load,
     weights->field = allocate_bf16(load, (elements));                          \
     if (!weights->field) return 0;                                              \
 } while (0)
-    ALLOCATE(input_norm, TEXT_HIDDEN);
-    ALLOCATE(query, (size_t)TEXT_QUERY_DIM * TEXT_HIDDEN);
-    ALLOCATE(key, (size_t)TEXT_KV_DIM * TEXT_HIDDEN);
-    ALLOCATE(value, (size_t)TEXT_KV_DIM * TEXT_HIDDEN);
-    ALLOCATE(query_norm, TEXT_HEAD_DIM);
-    ALLOCATE(key_norm, TEXT_HEAD_DIM);
-    ALLOCATE(attention_output, (size_t)TEXT_HIDDEN * TEXT_QUERY_DIM);
-    ALLOCATE(post_norm, TEXT_HIDDEN);
-    ALLOCATE(gate, (size_t)TEXT_INTERMEDIATE * TEXT_HIDDEN);
-    ALLOCATE(up, (size_t)TEXT_INTERMEDIATE * TEXT_HIDDEN);
-    ALLOCATE(down, (size_t)TEXT_HIDDEN * TEXT_INTERMEDIATE);
+    ALLOCATE(input_norm, TE.hidden);
+    ALLOCATE(query, (size_t)TE.query_dim * TE.hidden);
+    ALLOCATE(key, (size_t)TE.kv_dim * TE.hidden);
+    ALLOCATE(value, (size_t)TE.kv_dim * TE.hidden);
+    ALLOCATE(query_norm, TE.head_dim);
+    ALLOCATE(key_norm, TE.head_dim);
+    ALLOCATE(attention_output, (size_t)TE.hidden * TE.query_dim);
+    ALLOCATE(post_norm, TE.hidden);
+    ALLOCATE(gate, (size_t)TE.intermediate * TE.hidden);
+    ALLOCATE(up, (size_t)TE.intermediate * TE.hidden);
+    ALLOCATE(down, (size_t)TE.hidden * TE.intermediate);
 #undef ALLOCATE
     return 1;
 }
@@ -283,18 +341,18 @@ static int layer_weights_read_lane(const h3_weight_store *store, int layer,
                           error, error_size)) return 0;                         \
 } while (0)
     int item = 0;
-    READ_1D(input_norm, "input_layernorm.weight", TEXT_HIDDEN);
-    READ_2D(query, "self_attn.q_proj.weight", TEXT_QUERY_DIM, TEXT_HIDDEN);
-    READ_2D(key, "self_attn.k_proj.weight", TEXT_KV_DIM, TEXT_HIDDEN);
-    READ_2D(value, "self_attn.v_proj.weight", TEXT_KV_DIM, TEXT_HIDDEN);
-    READ_1D(query_norm, "self_attn.q_norm.weight", TEXT_HEAD_DIM);
-    READ_1D(key_norm, "self_attn.k_norm.weight", TEXT_HEAD_DIM);
-    READ_2D(attention_output, "self_attn.o_proj.weight", TEXT_HIDDEN,
-            TEXT_QUERY_DIM);
-    READ_1D(post_norm, "post_attention_layernorm.weight", TEXT_HIDDEN);
-    READ_2D(gate, "mlp.gate_proj.weight", TEXT_INTERMEDIATE, TEXT_HIDDEN);
-    READ_2D(up, "mlp.up_proj.weight", TEXT_INTERMEDIATE, TEXT_HIDDEN);
-    READ_2D(down, "mlp.down_proj.weight", TEXT_HIDDEN, TEXT_INTERMEDIATE);
+    READ_1D(input_norm, "input_layernorm.weight", TE.hidden);
+    READ_2D(query, "self_attn.q_proj.weight", TE.query_dim, TE.hidden);
+    READ_2D(key, "self_attn.k_proj.weight", TE.kv_dim, TE.hidden);
+    READ_2D(value, "self_attn.v_proj.weight", TE.kv_dim, TE.hidden);
+    READ_1D(query_norm, "self_attn.q_norm.weight", TE.head_dim);
+    READ_1D(key_norm, "self_attn.k_norm.weight", TE.head_dim);
+    READ_2D(attention_output, "self_attn.o_proj.weight", TE.hidden,
+            TE.query_dim);
+    READ_1D(post_norm, "post_attention_layernorm.weight", TE.hidden);
+    READ_2D(gate, "mlp.gate_proj.weight", TE.intermediate, TE.hidden);
+    READ_2D(up, "mlp.up_proj.weight", TE.intermediate, TE.hidden);
+    READ_2D(down, "mlp.down_proj.weight", TE.hidden, TE.intermediate);
 #undef READ_1D
 #undef READ_2D
     return 1;
@@ -420,47 +478,129 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
     if (!gpu_operation(gpu, (call), error, error_size, label, layer)) return 0; \
 } while (0)
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weight->input_norm,
-                             tokens, TEXT_HIDDEN, TEXT_RMS_EPSILON),
+                             tokens, TE.hidden, TEXT_RMS_EPSILON),
        "input RMSNorm");
     OP(h3_gpu_linear_bf16(gpu, query, norm, weight->query, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_QUERY_DIM), "query projection");
+                           TE.hidden, TE.query_dim), "query projection");
     OP(h3_gpu_linear_bf16(gpu, key, norm, weight->key, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_KV_DIM), "key projection");
+                           TE.hidden, TE.kv_dim), "key projection");
     OP(h3_gpu_linear_bf16(gpu, value, norm, weight->value, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_KV_DIM), "value projection");
+                           TE.hidden, TE.kv_dim), "value projection");
     OP(h3_gpu_head_rms_norm_bf16(gpu, query, weight->query_norm, tokens,
-                                  TEXT_QUERY_HEADS, TEXT_HEAD_DIM,
+                                  TE.query_heads, TE.head_dim,
                                   TEXT_RMS_EPSILON), "query RMSNorm");
     OP(h3_gpu_head_rms_norm_bf16(gpu, key, weight->key_norm, tokens,
-                                  TEXT_KV_HEADS, TEXT_HEAD_DIM,
+                                  TE.kv_heads, TE.head_dim,
                                   TEXT_RMS_EPSILON), "key RMSNorm");
     OP(h3_gpu_rope_text_bf16(gpu, query, key, rope_cos, rope_sin, tokens,
-                              TEXT_QUERY_HEADS, TEXT_KV_HEADS, TEXT_HEAD_DIM),
+                              TE.query_heads, TE.kv_heads, TE.head_dim),
        "RoPE");
     OP(h3_gpu_gqa_causal_bf16(gpu, attention_heads, query, key, value, tokens,
-                               TEXT_QUERY_HEADS, TEXT_KV_HEADS, TEXT_HEAD_DIM,
-                               1.0f / sqrtf((float)TEXT_HEAD_DIM)),
+                               TE.query_heads, TE.kv_heads, TE.head_dim,
+                               1.0f / sqrtf((float)TE.head_dim)),
        "causal GQA");
     OP(h3_gpu_linear_bf16(gpu, attention_output, attention_heads,
                            weight->attention_output, NULL, tokens,
-                           TEXT_QUERY_DIM, TEXT_HIDDEN),
+                           TE.query_dim, TE.hidden),
        "attention output projection");
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, attention_output,
-                        tokens * TEXT_HIDDEN), "attention residual");
+                        tokens * TE.hidden), "attention residual");
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weight->post_norm, tokens,
-                             TEXT_HIDDEN, TEXT_RMS_EPSILON),
+                             TE.hidden, TEXT_RMS_EPSILON),
        "post-attention RMSNorm");
     OP(h3_gpu_linear_bf16(gpu, gate, norm, weight->gate, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_INTERMEDIATE), "MLP gate");
+                           TE.hidden, TE.intermediate), "MLP gate");
     OP(h3_gpu_linear_bf16(gpu, up, norm, weight->up, NULL, tokens,
-                           TEXT_HIDDEN, TEXT_INTERMEDIATE), "MLP up");
+                           TE.hidden, TE.intermediate), "MLP up");
     OP(h3_gpu_silu_mul_bf16(gpu, gate, gate, up,
-                             tokens * TEXT_INTERMEDIATE), "fused SwiGLU");
+                             tokens * TE.intermediate), "fused SwiGLU");
     OP(h3_gpu_linear_bf16(gpu, mlp_output, gate, weight->down, NULL, tokens,
-                           TEXT_INTERMEDIATE, TEXT_HIDDEN), "MLP down");
+                           TE.intermediate, TE.hidden), "MLP down");
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, mlp_output,
-                        tokens * TEXT_HIDDEN), "MLP residual");
+                        tokens * TE.hidden), "MLP residual");
 #undef OP
+    return 1;
+}
+
+int load_adapter(h3_gpu *gpu, text_enc_adapter* adapter, char *error, size_t error_size) {
+    // Check for set adapter dir
+    if (!TE_ADAPTER) return 0;
+
+    // Load adapter weights store
+    h3_weight_store *store = h3_weight_store_open(TE_ADAPTER, error, error_size);
+    if (!store) {
+        fail(error, error_size, "adapter weight store failed to open");
+        return 0;
+    }
+
+    // Adapater is zeroed before load
+    memset(adapter, 0, sizeof(*adapter));
+
+    // Load adapter weights
+    adapter->mean_in         = h3_weight_load_f32(store, gpu, "mean_in", 1, (uint64_t[]){TE.hidden}, error, error_size);
+    adapter->std_in          = h3_weight_load_f32(store, gpu, "std_in", 1, (uint64_t[]){TE.hidden}, error, error_size);
+    adapter->weight          = h3_weight_load_f32(store, gpu, "W", 2, (uint64_t[]){H3_TEXT_HIDDEN_SIZE, TE.hidden}, error, error_size);
+    adapter->sink_out        = h3_weight_load_f32(store, gpu, "sink_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
+    /*
+    adapter->mlp_up_weight   = h3_weight_load_f32(store, gpu, "mlp.0.weight", 2, (uint64_t[]){TE_ADAPTER_INTERMEDIATE, TE.hidden}, error, error_size);
+    adapter->mlp_up_bias     = h3_weight_load_f32(store, gpu, "mlp.0.bias", 1, (uint64_t[]){TE_ADAPTER_INTERMEDIATE}, error, error_size);
+    adapter->mlp_down_weight = h3_weight_load_f32(store, gpu, "mlp.2.weight", 2, (uint64_t[]){H3_TEXT_HIDDEN_SIZE, TE_ADAPTER_INTERMEDIATE}, error, error_size);
+    adapter->mlp_down_bias   = h3_weight_load_f32(store, gpu, "mlp.2.bias", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
+    */
+    adapter->std_out         = h3_weight_load_f32(store, gpu, "std_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
+    adapter->mean_out        = h3_weight_load_f32(store, gpu, "mean_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
+
+    // Free weights store
+    h3_weight_store_free(store);
+
+    // Check for valid weights
+    if (!adapter->mean_in || !adapter->std_in ||
+        !adapter->mean_out || !adapter->std_out ||
+        //!adapter->mlp_up_weight || !adapter->mlp_up_bias ||
+        //!adapter->mlp_down_weight || !adapter->mlp_down_bias ||
+        !adapter->weight || !adapter->sink_out) {
+        fail(error, error_size, "adapter weights missing");
+        return 0;
+    }
+
+    // Return success
+    return 1;
+}
+
+int apply_adapter(h3_gpu *gpu, text_enc_adapter *adapter,
+                  h3_gpu_tensor *input_bf16, h3_gpu_tensor *input_f32,
+                  h3_gpu_tensor *output_bf16, h3_gpu_tensor *output_f32,
+                  uint32_t tokens,
+                  char *error, size_t error_size) {
+    // Apply gpu operations
+#define OP(call, label) do {                                                 \
+    if (!gpu_operation(gpu, (call), error, error_size, label, -1)) return 0; \
+} while (0)
+    OP(h3_gpu_begin(gpu),
+        "adapter begin");
+    OP(h3_gpu_cast(gpu, input_f32, input_bf16, tokens * TE.hidden),
+        "adapter cast f32");
+    OP(h3_gpu_standardize_f32(gpu, input_f32, input_f32, adapter->mean_in, adapter->std_in,
+                    tokens * TE.hidden, TE.hidden, 1),
+        "adapter standardize");
+    OP(h3_gpu_linear_f32(gpu, output_f32, input_f32, adapter->weight, NULL,
+                    tokens, TE.hidden, H3_TEXT_HIDDEN_SIZE),
+       "adapter linear");
+    OP(h3_gpu_unstandardize_f32(gpu, output_f32, output_f32, adapter->mean_out, adapter->std_out,
+                    tokens * H3_TEXT_HIDDEN_SIZE, H3_TEXT_HIDDEN_SIZE, 1),
+        "adapter unstandardize");
+    // Single row vector copy to overwrite sink_out over token index 0
+    if (adapter->sink_out && tokens > 0) {
+        OP(h3_gpu_copy_f32(gpu, output_f32, 0, adapter->sink_out, 0, H3_TEXT_HIDDEN_SIZE),
+            "adapter sink (token 0)");
+    }
+    OP(h3_gpu_cast(gpu, output_bf16, output_f32, tokens * H3_TEXT_HIDDEN_SIZE),
+        "adapter cast bf16");
+    OP(h3_gpu_submit(gpu),
+        "adapter submit");
+#undef OP
+
+    // Return success
     return 1;
 }
 
@@ -484,14 +624,14 @@ static int text_encode_bf16_impl(
     if (output) memset(output, 0, sizeof(*output));
     if (!weight_directory || !shader_source_path || !token_ids || !token_count ||
         !output || token_count > UINT32_MAX ||
-        layer_count < 1 || layer_count > TEXT_LAYERS ||
-        token_count > UINT32_MAX / TEXT_HIDDEN ||
-        token_count > UINT32_MAX / TEXT_INTERMEDIATE) {
+        layer_count < 1 || layer_count > TE.layers ||
+        token_count > UINT32_MAX / TE.hidden ||
+        token_count > UINT32_MAX / TE.intermediate) {
         fail(error, error_size, "invalid Qwen text encoder arguments");
         return 0;
     }
     for (size_t index = 0; index < token_count; index++) {
-        if (token_ids[index] >= TEXT_VOCAB) {
+        if (token_ids[index] >= TE.vocab) {
             fail(error, error_size, "Qwen token ID %u is outside the vocabulary",
                  token_ids[index]);
             return 0;
@@ -525,13 +665,13 @@ static int text_encode_bf16_impl(
     h3_gpu_profile_set_label(gpu, "Qwen text encoder");
     load_context load = {store, gpu, {NULL}, 0, error, error_size};
     uint32_t tokens = (uint32_t)token_count;
-    size_t hidden_count = token_count * TEXT_HIDDEN;
-    size_t query_count = token_count * TEXT_QUERY_DIM;
-    size_t kv_count = token_count * TEXT_KV_DIM;
-    size_t intermediate_count = token_count * TEXT_INTERMEDIATE;
+    size_t hidden_count = token_count * TE.hidden;
+    size_t query_count = token_count * TE.query_dim;
+    size_t kv_count = token_count * TE.kv_dim;
+    size_t intermediate_count = token_count * TE.intermediate;
 
-    float *cosines = malloc(token_count * TEXT_ROPE_HALF * sizeof(*cosines));
-    float *sines = malloc(token_count * TEXT_ROPE_HALF * sizeof(*sines));
+    float *cosines = malloc(token_count * TE.rope_half * sizeof(*cosines));
+    float *sines = malloc(token_count * TE.rope_half * sizeof(*sines));
     if (!cosines || !sines) {
         fail(error, error_size, "out of memory allocating Qwen RoPE tables");
         free(cosines);
@@ -540,14 +680,14 @@ static int text_encode_bf16_impl(
         h3_weight_store_free(store);
         return 0;
     }
-    float inverse_frequency[TEXT_ROPE_HALF];
-    for (size_t index = 0; index < TEXT_ROPE_HALF; index++) {
+    float inverse_frequency[TE.rope_half];
+    for (size_t index = 0; index < TE.rope_half; index++) {
         inverse_frequency[index] = 1.0f /
             powf(TEXT_ROPE_THETA,
-                 (float)(index * 2) / (float)TEXT_HEAD_DIM);
+                 (float)(index * 2) / (float)TE.head_dim);
     }
     for (size_t position = 0; position < token_count; position++) {
-        for (size_t index = 0; index < TEXT_ROPE_HALF; index++) {
+        for (size_t index = 0; index < TE.rope_half; index++) {
             size_t axis = 0;
             if (position_ids && index < 60 && index % 3 == 1) axis = 1;
             else if (position_ids && index < 60 && index % 3 == 2) axis = 2;
@@ -560,9 +700,9 @@ static int text_encode_bf16_impl(
             /* The explicit Qwen mRoPE path casts its tables to the BF16
              * embedding dtype. Keep F32 storage for the fused Metal kernel,
              * but pin the values to that same operation boundary. */
-            cosines[position * TEXT_ROPE_HALF + index] =
+            cosines[position * TE.rope_half + index] =
                 position_ids ? round_bf16(cosine) : cosine;
-            sines[position * TEXT_ROPE_HALF + index] =
+            sines[position * TE.rope_half + index] =
                 position_ids ? round_bf16(sine) : sine;
         }
     }
@@ -595,9 +735,9 @@ static int text_encode_bf16_impl(
             memset(values, 0, hidden_count * sizeof(*values));
             for (size_t index = 0; index < span_count; index++) {
                 const h3_text_vision_span *span = &spans[index];
-                memcpy(values + span->start * TEXT_HIDDEN,
+                memcpy(values + span->start * TE.hidden,
                        span->deepstack[layer],
-                       span->tokens * TEXT_HIDDEN * sizeof(*values));
+                       span->tokens * TE.hidden * sizeof(*values));
             }
             deepstack[layer] = h3_gpu_tensor_load(gpu, values, hidden_count, H3_GPU_BF16);
         }
@@ -620,14 +760,14 @@ static int text_encode_bf16_impl(
     }
 
     h3_gpu_tensor *embedding_weight = load_2d(
-        &load, "model.language_model.embed_tokens.weight", TEXT_VOCAB,
-        TEXT_HIDDEN);
+        &load, "model.language_model.embed_tokens.weight", TE.vocab,
+        TE.hidden);
     if (!embedding_weight) goto cleanup;
     if (!gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
                        "command stream begin", -1) ||
         !gpu_operation(gpu, h3_gpu_embedding_bf16(
                                  gpu, hidden, embedding_weight, ids, tokens,
-                                 TEXT_VOCAB, TEXT_HIDDEN),
+                                 TE.vocab, TE.hidden),
                        error, error_size, "embedding lookup", -1) ||
         !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
                        "embedding stream submit", -1)) {
@@ -637,8 +777,8 @@ static int text_encode_bf16_impl(
     for (size_t index = 0; index < span_count; index++) {
         const h3_text_vision_span *span = &spans[index];
         if (!h3_gpu_tensor_write_bf16_range(
-                hidden, span->start * TEXT_HIDDEN, span->embeddings,
-                span->tokens * TEXT_HIDDEN)) {
+                hidden, span->start * TE.hidden, span->embeddings,
+                span->tokens * TE.hidden)) {
             fail(error, error_size, "cannot splice Qwen vision embeddings");
             goto cleanup;
         }
@@ -674,7 +814,7 @@ static int text_encode_bf16_impl(
             (!(layer < 3 && span_count) ||
              gpu_operation(gpu, h3_gpu_add_bf16(
                  gpu, hidden, hidden, deepstack[layer],
-                 tokens * TEXT_HIDDEN), error, error_size,
+                 tokens * TE.hidden), error, error_size,
                  "deepstack residual", layer)) &&
             gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
                           "layer stream submit", layer);
@@ -684,7 +824,7 @@ static int text_encode_bf16_impl(
             prefetch_slots_retire(slots, prefetch_depth);
             goto cleanup;
         }
-        if (progress) progress(layer + 1, TEXT_LAYERS, progress_opaque);
+        if (progress) progress(layer + 1, TE.layers, progress_opaque);
         if (layer + 1 >= layer_count) continue;
 
         memset(&weights, 0, sizeof(weights));
@@ -720,19 +860,51 @@ static int text_encode_bf16_impl(
         }
     }
 
-    output->values = malloc(hidden_count * sizeof(*output->values));
+    // Check if we are using an adapter, regardless of model size
+    h3_gpu_tensor *adapter_input_f32 = NULL;
+    h3_gpu_tensor *adapter_output_f32 = NULL;
+    h3_gpu_tensor *adapter_output_bf16 = NULL;
+    if (TE_ADAPTER) {
+        // Create adapter weights struct
+        text_enc_adapter adapter;
+        // Load adapter weights
+        if (!load_adapter(gpu, &adapter, error, error_size)) {
+            //fail(error, error_size, "failed to load text encoder adapter");
+            goto cleanup;
+        }
+
+        // Allocate output hidden for correct ouput dim
+        adapter_input_f32 = h3_gpu_tensor_new(gpu, token_count * TE.hidden, H3_GPU_F32);
+        adapter_output_f32 = h3_gpu_tensor_new(gpu, token_count * H3_TEXT_HIDDEN_SIZE, H3_GPU_F32);
+        adapter_output_bf16 = h3_gpu_tensor_new(gpu, token_count * H3_TEXT_HIDDEN_SIZE, H3_GPU_BF16);
+        // Apply adapter
+        if (!apply_adapter(gpu, &adapter,
+                            hidden, adapter_input_f32,
+                            adapter_output_bf16, adapter_output_f32,
+                            tokens, error, error_size)) {
+            //fail(error, error_size, "failed to apply text encoder adapter");
+            goto cleanup;
+        }
+
+        // Replace hidden with adapter hidden, put original hidden in adapter_hidden to free later
+        hidden = adapter_output_bf16;
+    }
+
+    size_t output_hidden_size = H3_TEXT_HIDDEN_SIZE;
+    size_t output_count = token_count * output_hidden_size;
+    output->values = malloc(output_count * sizeof(*output->values));
     if (!output->values) {
         fail(error, error_size, "out of memory reading Qwen output");
         goto cleanup;
     }
-    if (!h3_gpu_tensor_read_bf16(hidden, output->values, hidden_count) ||
+    if (!h3_gpu_tensor_read_bf16(hidden, output->values, output_count) ||
         !h3_gpu_get_stats(gpu, &output->gpu_stats)) {
         h3_text_embedding_free(output);
         fail(error, error_size, "cannot read completed Qwen output");
         goto cleanup;
     }
     output->tokens = token_count;
-    output->width = TEXT_HIDDEN;
+    output->width = output_hidden_size;
     if (tags) {
         output->tags = malloc(token_count * sizeof(*output->tags));
         if (!output->tags) {
@@ -752,6 +924,11 @@ finished:
     for (size_t index = 0; index < sizeof(activations) / sizeof(*activations);
          index++) {
         h3_gpu_tensor_free(activations[index]);
+    }
+    if (TE_ADAPTER) {
+        if (adapter_input_f32) h3_gpu_tensor_free(adapter_input_f32);
+        if (adapter_output_bf16) h3_gpu_tensor_free(adapter_output_bf16);
+        if (adapter_output_f32) h3_gpu_tensor_free(adapter_output_f32);
     }
     h3_gpu_free(gpu);
     h3_weight_store_free(store);
@@ -787,7 +964,7 @@ int h3_text_encode_bf16(const char *weight_directory,
                         char *error, size_t error_size) {
     return text_encode_bf16_impl(
         weight_directory, shader_source_path, token_ids, token_count,
-        NULL, 0, NULL, NULL, TEXT_LAYERS, progress, progress_opaque,
+        NULL, 0, NULL, NULL, TE.layers, progress, progress_opaque,
         output, error, error_size);
 }
 
@@ -807,7 +984,7 @@ int h3_text_encode_multimodal_bf16(
     }
     return text_encode_bf16_impl(
         weight_directory, shader_source_path, token_ids, token_count,
-        spans, span_count, position_ids, tags, TEXT_LAYERS,
+        spans, span_count, position_ids, tags, TE.layers,
         progress, progress_opaque,
         output, error, error_size);
 }
