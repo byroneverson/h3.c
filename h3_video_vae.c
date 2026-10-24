@@ -1307,6 +1307,7 @@ int h3_video_vae_decode(const char *weight_directory,
                                    error, error_size)) return 0;
     int tile_pixels = configured_tile_pixels(
         latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
+    // Allow short video output for debugging
     /*if (latent_time == 2 &&
         (latent_height > TILE_PIXELS / SPATIAL_RATIO ||
          latent_width > TILE_PIXELS / SPATIAL_RATIO)) {

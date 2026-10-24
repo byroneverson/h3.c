@@ -962,6 +962,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int render_height = params->render_height ? params->render_height :
                                                  params->height;
     if (h3_align_frame_count(params->frames) < 22) {
+    // Allow short video output for debugging
+    if (h3_align_frame_count(params->frames) < 5) { //22) {
         h3_set_error(ctx,
             "generation requires at least one trained 22-frame decoder chunk");
         return NULL;
