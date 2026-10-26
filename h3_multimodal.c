@@ -156,6 +156,7 @@ static int encode_presentation(const char *weight_directory,
                                h3_text_progress progress,
                                void *progress_opaque,
                                h3_text_embedding *output,
+                               int text_enc_size,
                                char *error, size_t error_size) {
     if (!ids->count || ids->count > INT_MAX || ids->count > SIZE_MAX / 3 ||
         ids->count > SIZE_MAX / sizeof(uint32_t)) {
@@ -189,7 +190,7 @@ static int encode_presentation(const char *weight_directory,
     int ok = h3_text_encode_multimodal_bf16(
         weight_directory, shader_source_path, ids->values, ids->count,
         spans, span_count, positions, tags, progress, progress_opaque,
-        output, error, error_size);
+        output, text_enc_size, error, error_size);
     free(positions); free(tags);
     return ok;
 }
@@ -202,6 +203,7 @@ int h3_multimodal_encode_fl2va_bf16(
                         const h3_vision_output *images, size_t image_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (output) memset(output, 0, sizeof(*output));
@@ -228,7 +230,7 @@ int h3_multimodal_encode_fl2va_bf16(
     if (!tokenize_append(tokenizer, prompt, &ids, error, error_size)) goto cleanup;
     ok = encode_presentation(weight_directory, shader_source_path,
         &ids, spans, visions, image_count, progress, progress_opaque,
-        output, error, error_size);
+        output, text_enc_size, error, error_size);
     goto cleanup;
 
 oom:
@@ -249,6 +251,7 @@ int h3_multimodal_encode_ref2va_bf16(
                         size_t reference_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (output) memset(output, 0, sizeof(*output));
@@ -340,7 +343,7 @@ int h3_multimodal_encode_ref2va_bf16(
     {
         int ok = encode_presentation(weight_directory, shader_source_path,
             &ids, spans, visions, span_count, progress, progress_opaque,
-            output, error, error_size);
+            output, text_enc_size, error, error_size);
         free(ids.values); free(spans); free(visions);
         return ok;
     }

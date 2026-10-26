@@ -133,7 +133,6 @@ typedef struct {
      * a blurry-then-sharpening preview instead. */
     int preview_mode;
     int text_enc_size;
-    const char *text_enc_adapter;
     int use_f16_dit;
     int lup_enabled;
     float lup_scale;
@@ -158,7 +157,7 @@ enum {
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, H3_PREVIEW_RAW, \
-    H3_TEXT_ENC_32B, NULL, \
+    H3_TEXT_ENC_32B, \
     0, \
     0, 2.0, 2, \
     NULL, NULL, NULL \

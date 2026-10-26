@@ -65,7 +65,6 @@ static void usage(const char *program) {
         "                         literal noisy sample) or estimate (reconstructs\n"
         "                         the estimated clean sample, sharpens earlier)\n"
         "      --use-text-encoder S  Text encoder size: 32b (default), 8b, or 4b\n"
-        "      --use-text-encoder-adapter PATH  Path of text encoder adapter directory\n"
         "      --use-f16-dit      Use f16 for dit blocks (Amduraznak's fix modified for M1)\n"
         "      --lup-enabled      Enable latent upscaler (LBH-123-AI's latent upscaler)\n"
         "      --lup-scale S      Latent upscaler scale (default: 2.0)\n"
@@ -304,7 +303,6 @@ int main(int argc, char **argv) {
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
            OPT_PREVIEW_FRAMES, OPT_PREVIEW_MODE,
            OPT_TEXT_ENC_SIZE,
-           OPT_TEXT_ENC_ADAPTER,
            OPT_USE_F16_DIT,
            OPT_LUP_ENABLED,
            OPT_LUP_SCALE,
@@ -363,7 +361,6 @@ int main(int argc, char **argv) {
         {"preview-frames", required_argument, NULL, OPT_PREVIEW_FRAMES},
         {"preview-mode", required_argument, NULL, OPT_PREVIEW_MODE},
         {"use-text-encoder", required_argument, NULL, OPT_TEXT_ENC_SIZE},
-        {"use-text-encoder-adapter", required_argument, NULL, OPT_TEXT_ENC_ADAPTER},
         {"use-f16-dit", no_argument, NULL, OPT_USE_F16_DIT},
         {"lup-enabled", no_argument, NULL, OPT_LUP_ENABLED},
         {"lup-scale", required_argument, NULL, OPT_LUP_SCALE},
@@ -551,7 +548,6 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 break;
-            case OPT_TEXT_ENC_ADAPTER: params.text_enc_adapter = optarg; break;
             case OPT_USE_F16_DIT:
                 params.use_f16_dit = 1;
                 break;

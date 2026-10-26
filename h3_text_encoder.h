@@ -37,6 +37,7 @@ int h3_text_encode_bf16(const char *weight_directory,
                         const uint32_t *token_ids, size_t token_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size);
 
 /* Run the same 50 decoder layers with Qwen3-VL presentation spans. The base
@@ -51,6 +52,7 @@ int h3_text_encode_multimodal_bf16(
                         const uint32_t *position_ids, const uint8_t *tags,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size);
 
 /* Prefix form used by parity tooling to localize a multimodal mismatch. */
@@ -63,6 +65,7 @@ int h3_text_encode_multimodal_layers_bf16(
                         int layer_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size);
 void h3_text_embedding_free(h3_text_embedding *embedding);
 

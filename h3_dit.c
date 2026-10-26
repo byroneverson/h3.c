@@ -1877,13 +1877,6 @@ static void schedule_report(int completed, int total, void *opaque) {
     report(state->callback, state->opaque, "precompute AdaLN", completed, total);
 }
 
-static char *h3_path(const char *root, const char *relative) {
-    size_t size = strlen(root) + strlen(relative) + 2;
-    char *result = malloc(size);
-    if (result) snprintf(result, size, "%s/%s", root, relative);
-    return result;
-}
-
 typedef struct {
     h3_dit_progress callback;
     void *opaque;
@@ -2089,13 +2082,14 @@ static h3_dit *load_dit(const char *weight_directory,
 
     dit->lup = NULL;
     if (lup_enabled) {
-        char *lup_weight_dir = h3_path(weight_directory, "../latent_upscaler");
+        const char *lup_path = h3_path_join(weight_directory, "../latent_upscaler");
         lup_progress lup_state = {progress, progress_opaque};
-        dit->lup = h3_lup_load(dit->gpu, lup_weight_dir,
+        dit->lup = h3_lup_load(dit->gpu, lup_path,
                                 lup_scale, lup_steps,
                                 lup_layout, text,
                                 lup_load_report, &lup_state,
                                 error, error_size);
+        free((void *)lup_path);
         if (!dit->lup) goto failed;
     }
 

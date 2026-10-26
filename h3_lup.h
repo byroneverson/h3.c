@@ -22,7 +22,7 @@ typedef void (*h3_lup_progress)(int completed_blocks, int total_blocks, void *op
 
 int h3_lup_scale_latent(int latent, float scale);
 
-h3_lup *h3_lup_load(h3_gpu *gpu, const char *weight_directory,
+h3_lup *h3_lup_load(h3_gpu *gpu, const char *weight_path,
                     float scale, uint32_t steps,
                     h3_layout *layout_upscaled, h3_text_embedding *text,
                     h3_lup_progress progress, void *progress_opaque,

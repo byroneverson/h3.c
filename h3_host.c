@@ -491,6 +491,13 @@ const char *h3_segment_name(h3_segment_kind kind) {
     return "unknown";
 }
 
+const char *h3_path_join(const char *base, const char *relative) {
+    size_t size = strlen(base) + strlen(relative) + 2;
+    char *result = malloc(size);
+    if (result) snprintf(result, size, "%s/%s", base, relative);
+    return result;
+}
+
 uint32_t h3_rng_u32(h3_rng *rng) {
     uint64_t old_state = rng->state;
     rng->state = old_state * UINT64_C(6364136223846793005) + rng->increment;

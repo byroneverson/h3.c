@@ -1,7 +1,9 @@
 #include "h3_text_encoder.h"
 
+#include "h3.h"
 #include "h3_gpu.h"
 #include "h3_weights.h"
+#include "h3_host.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -61,7 +63,7 @@ typedef struct {
 } text_enc_adapter;
 
 static int TE_SIZE = H3_TEXT_ENC_32B;
-static const char *TE_ADAPTER = NULL;
+//static const char *TE_ADAPTER = NULL;
 //static int TE_ADAPTER_INTERMEDIATE = 32768;
 
 static const float TEXT_RMS_EPSILON = 1e-6f;
@@ -183,9 +185,8 @@ static int text_prefetch_depth(const h3_gpu *gpu) {
     return (int)depth;
 }
 
-void h3_text_init_arch(int text_enc_size, const char *text_enc_adapter) {
+void init_text_enc(int text_enc_size) {
     TE_SIZE = text_enc_size;
-    TE_ADAPTER = text_enc_adapter;
     if (text_enc_size == H3_TEXT_ENC_4B) {
         TE = (text_enc_arch){.layers = 24, .hidden = 2560, .intermediate = 9728, .query_heads = 32, .kv_heads = 8, .head_dim = 128};
     } else if (text_enc_size == H3_TEXT_ENC_8B) {
@@ -522,12 +523,12 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
     return 1;
 }
 
-int load_adapter(h3_gpu *gpu, text_enc_adapter* adapter, char *error, size_t error_size) {
+int load_adapter(h3_gpu *gpu, const char *path, text_enc_adapter* adapter, char *error, size_t error_size) {
     // Check for set adapter dir
-    if (!TE_ADAPTER) return 0;
+    if (!path) return 0;
 
     // Load adapter weights store
-    h3_weight_store *store = h3_weight_store_open(TE_ADAPTER, error, error_size);
+    h3_weight_store *store = h3_weight_store_open(path, error, error_size);
     if (!store) {
         fail(error, error_size, "adapter weight store failed to open");
         return 0;
@@ -620,7 +621,11 @@ static int text_encode_bf16_impl(
                         int layer_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size) {
+    // Init text encoder
+    init_text_enc(text_enc_size);
+
     if (output) memset(output, 0, sizeof(*output));
     if (!weight_directory || !shader_source_path || !token_ids || !token_count ||
         !output || token_count > UINT32_MAX ||
@@ -864,25 +869,27 @@ static int text_encode_bf16_impl(
     h3_gpu_tensor *adapter_input_f32 = NULL;
     h3_gpu_tensor *adapter_output_f32 = NULL;
     h3_gpu_tensor *adapter_output_bf16 = NULL;
-    if (TE_ADAPTER) {
-        // Create adapter weights struct
+    if (TE_SIZE != H3_TEXT_ENC_32B) {
         text_enc_adapter adapter;
+        const char *adapter_path = h3_path_join(weight_directory, "../adapter");
         // Load adapter weights
-        if (!load_adapter(gpu, &adapter, error, error_size)) {
-            //fail(error, error_size, "failed to load text encoder adapter");
+        ok = load_adapter(gpu, adapter_path, &adapter, error, error_size);
+        free((void *)adapter_path);
+        if (!ok) {
+            fail(error, error_size, "text encoder adapter load failed");
             goto cleanup;
         }
-
         // Allocate output hidden for correct ouput dim
         adapter_input_f32 = h3_gpu_tensor_new(gpu, token_count * TE.hidden, H3_GPU_F32);
         adapter_output_f32 = h3_gpu_tensor_new(gpu, token_count * H3_TEXT_HIDDEN_SIZE, H3_GPU_F32);
         adapter_output_bf16 = h3_gpu_tensor_new(gpu, token_count * H3_TEXT_HIDDEN_SIZE, H3_GPU_BF16);
         // Apply adapter
-        if (!apply_adapter(gpu, &adapter,
-                            hidden, adapter_input_f32,
-                            adapter_output_bf16, adapter_output_f32,
-                            tokens, error, error_size)) {
-            //fail(error, error_size, "failed to apply text encoder adapter");
+        ok = apply_adapter(gpu, &adapter,
+                           hidden, adapter_input_f32,
+                           adapter_output_bf16, adapter_output_f32,
+                           tokens, error, error_size);
+        if (!ok) {
+            fail(error, error_size, "text encoder adapter apply failed");
             goto cleanup;
         }
 
@@ -925,7 +932,7 @@ finished:
          index++) {
         h3_gpu_tensor_free(activations[index]);
     }
-    if (TE_ADAPTER) {
+    if (TE_SIZE != H3_TEXT_ENC_32B) {
         if (adapter_input_f32) h3_gpu_tensor_free(adapter_input_f32);
         if (adapter_output_bf16) h3_gpu_tensor_free(adapter_output_bf16);
         if (adapter_output_f32) h3_gpu_tensor_free(adapter_output_f32);
@@ -961,11 +968,12 @@ int h3_text_encode_bf16(const char *weight_directory,
                         const uint32_t *token_ids, size_t token_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size) {
     return text_encode_bf16_impl(
         weight_directory, shader_source_path, token_ids, token_count,
         NULL, 0, NULL, NULL, TE.layers, progress, progress_opaque,
-        output, error, error_size);
+        output, text_enc_size, error, error_size);
 }
 
 int h3_text_encode_multimodal_bf16(
@@ -976,6 +984,7 @@ int h3_text_encode_multimodal_bf16(
                         const uint32_t *position_ids, const uint8_t *tags,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size) {
     if (!spans || !span_count || !position_ids || !tags) {
         if (output) memset(output, 0, sizeof(*output));
@@ -986,7 +995,7 @@ int h3_text_encode_multimodal_bf16(
         weight_directory, shader_source_path, token_ids, token_count,
         spans, span_count, position_ids, tags, TE.layers,
         progress, progress_opaque,
-        output, error, error_size);
+        output, text_enc_size, error, error_size);
 }
 
 int h3_text_encode_multimodal_layers_bf16(
@@ -998,6 +1007,7 @@ int h3_text_encode_multimodal_layers_bf16(
                         int layer_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size) {
     if (!spans || !span_count || !position_ids || !tags) {
         if (output) memset(output, 0, sizeof(*output));
@@ -1007,5 +1017,5 @@ int h3_text_encode_multimodal_layers_bf16(
     return text_encode_bf16_impl(
         weight_directory, shader_source_path, token_ids, token_count,
         spans, span_count, position_ids, tags, layer_count,
-        progress, progress_opaque, output, error, error_size);
+        progress, progress_opaque, output, text_enc_size, error, error_size);
 }

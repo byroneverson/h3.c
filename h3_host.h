@@ -120,6 +120,8 @@ int h3_layout_build(const h3_layout_spec *spec, h3_layout *layout,
 void h3_layout_free(h3_layout *layout);
 const char *h3_segment_name(h3_segment_kind kind);
 
+const char *h3_path_join(const char *base, const char *relative);
+
 void h3_rng_seed(h3_rng *rng, uint64_t seed);
 uint32_t h3_rng_u32(h3_rng *rng);
 float h3_rng_normal(h3_rng *rng);

@@ -1005,7 +1005,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     size_t condition_audio_elements = 0;
     h3_text_embedding text;
     memset(&text, 0, sizeof(text));
-    h3_text_init_arch(params->text_enc_size, params->text_enc_adapter);
     h3_layout layout;
     memset(&layout, 0, sizeof(layout));
     h3_dit *dit = NULL;
@@ -1511,11 +1510,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                 tokenizer, text_path, "h3_shaders.metal", prompt,
                 presentations, params->reference_count,
                 h3_text_progress_bridge, &progress, &text,
+                params->text_enc_size,
                 detail, sizeof(detail)) :
             h3_multimodal_encode_fl2va_bf16(
                 tokenizer, text_path, "h3_shaders.metal", prompt,
                 vision_outputs, visual_count,
                 h3_text_progress_bridge, &progress, &text,
+                params->text_enc_size,
                 detail, sizeof(detail));
         if (!text_ok) {
             h3_set_error(ctx, "%s", detail);
@@ -1533,6 +1534,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         if (!h3_text_encode_bf16(
                 text_path, "h3_shaders.metal", ids, token_count,
                 h3_text_progress_bridge, &progress, &text,
+                params->text_enc_size,
                 detail, sizeof(detail))) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;

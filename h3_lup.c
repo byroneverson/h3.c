@@ -336,7 +336,7 @@ h3_lup_ctx *h3_lup_get_ctx(h3_lup *lup) {
     return &lup->ctx;
 }
 
-h3_lup *h3_lup_load(h3_gpu *gpu, const char *weight_directory,
+h3_lup *h3_lup_load(h3_gpu *gpu, const char *weight_path,
                     float scale, uint32_t steps,
                     h3_layout *layout, h3_text_embedding *text,
                     h3_lup_progress progress, void *progress_opaque,
@@ -347,7 +347,7 @@ h3_lup *h3_lup_load(h3_gpu *gpu, const char *weight_directory,
         return NULL;
     }
     lup->gpu = gpu;
-    lup->weights = h3_weight_store_open(weight_directory, error, error_size);
+    lup->weights = h3_weight_store_open(weight_path, error, error_size);
     if (!lup->weights) goto failed;
 
     lup->ctx.scale = scale;

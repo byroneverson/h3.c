@@ -20,6 +20,7 @@ int h3_multimodal_encode_fl2va_bf16(
                         const h3_vision_output *images, size_t image_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size);
 
 typedef enum {
@@ -49,6 +50,7 @@ int h3_multimodal_encode_ref2va_bf16(
                         size_t reference_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
+                        int text_enc_size,
                         char *error, size_t error_size);
 
 #endif
