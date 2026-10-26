@@ -1,3 +1,23 @@
+# h3.c (Fork)
+
+> **Notice:** This is an expanded fork of [`antirez/h3.c`](https://github.com/antirez/h3.c) featuring optimized performance, flexible text encoders, and enhanced generation pipelines.
+
+## Key Features & Modifications
+
+* **FP16 DiT Support**: Native FP16 precision support for the Diffusion Transformer (DiT) utilizing exact-math overflow protection. Originally created to enable fast execution on NVIDIA GPUs (such as Volta/V100) that lack native BF16 tensor core support.  
+  *(Based on [Amduraznak/minimax-h3-fp16-fix](https://github.com/Amduraznak/minimax-h3-fp16-fix))*
+
+* **LoRA Support**: Built-in functionality for loading and applying Low-Rank Adaptation weights dynamically during inference, specifically targeted to support `minimax_h3_turbo_v4_step600.safetensors`.  
+  *(Based on [larryvrh/MiniMax-H3-Turbo-Lora](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora))*
+
+* **Text Encoder Adapter**: Integrated adapter and projection support allowing smaller, alternative text encoder sizes (such as 4B and 8B variants) to seamlessly replace larger default requirements.  
+  *(Based on [NicoLab28/ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3))*
+
+* **Latent Upscaler**: Integrated latent upscaling capabilities (`h3_lup`) that bypass costly full VAE encode/decode cycles to accelerate high-resolution video frame generation.  
+  *(Based on [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler))*
+
+---
+
 # h3-metal
 
 Native MiniMax-H3 inference for Apple Silicon. The project is being built as a
