@@ -22,9 +22,8 @@
   Usage:
   - Place the relevant text encoder model into the same directory as the default "text_encoder" folder but rename the model folder to either "text_encoder_4b" or "text_encoder_8b" depending on which model is chosen.
   - The ClipProj "-mlp" variant is currently unsupported, tested with "mmh3-4b-ClipProj-v3.1.safetensors" and "mmh3-8b-ClipProj-v3.1.safetensors" only.
-  - Place the adapter safetensors in a subfolder called "ClipProj-MiniMax-H3" within your text_encoder_4b/text_encoder_8b directory. Use this subfolder path for the following args.
+  - Place the adapter safetensors in a subfolder named "adapter" within your text_encoder_4b/text_encoder_8b directory.
   - `--use-text-encoder S` Text encoder size: 32b (default), 8b, or 4b
-  - `--use-text-encoder-adapter PATH` Path of text encoder adapter directory
 
 * **Latent Upscaler**: Integrated latent upscaling capabilities (`h3_lup`) that bypass costly full VAE encode/decode cycles to accelerate high-resolution video frame generation.  
   *(Based on [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler))*
