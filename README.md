@@ -4,17 +4,35 @@
 
 ## Key Features & Modifications
 
-* **FP16 DiT Support**: Native FP16 precision support for the Diffusion Transformer (DiT) utilizing exact-math overflow protection. Originally created to enable fast execution on NVIDIA GPUs (such as Volta/V100) that lack native BF16 tensor core support.  
+* **F16 DiT Support**: Native FP16 precision support for the Diffusion Transformer (DiT) utilizing exact-math overflow protection. Originally created to enable fast execution on NVIDIA GPUs (such as Volta/V100) that lack native BF16 tensor core support. Adapted for use with the Apple M1 due to lack of native bf16 support.
   *(Based on [Amduraznak/minimax-h3-fp16-fix](https://github.com/Amduraznak/minimax-h3-fp16-fix))*
 
-* **LoRA Support**: Built-in functionality for loading and applying Low-Rank Adaptation weights dynamically during inference, specifically targeted to support `minimax_h3_turbo_v4_step600.safetensors`.  
+  Usage:
+  - `--use-f16-dit` Use f16 for dit blocks (Amduraznak's fix modified for M1)
+
+* **LoRA Support**: Built-in functionality for loading and applying Low-Rank Adaptation weights dynamically during inference, specifically targeted to support LoRAs from larryvrh. Only tested with `minimax_h3_turbo_v4_step600.safetensors`.  
   *(Based on [larryvrh/MiniMax-H3-Turbo-Lora](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora))*
 
-* **Text Encoder Adapter**: Integrated adapter and projection support allowing smaller, alternative text encoder sizes (such as 4B and 8B variants) to seamlessly replace larger default requirements.  
+  Usage:
+  - LoRA weights will automatically be loaded for relevant tensors if the lora safetensors file is located inside the transformer weight directory.
+
+* **Text Encoder Adapter**: Allows the use of smaller Qwen3-VL variants (such as Qwen3-VL-4B and Qwen3-VL-8B) instead of the default text encoder, which used Qwen3-VL-32B. 
   *(Based on [NicoLab28/ClipProj-MiniMax-H3](https://huggingface.co/NicoLab28/ClipProj-MiniMax-H3))*
+  
+  Usage:
+  - Place the relevant text encoder model into the same directory as the default "text_encoder" folder but rename the model folder to either "text_encoder_4b" or "text_encoder_8b" depending on which model is chosen.
+  - The ClipProj "-mlp" variant is currently unsupported, tested with "mmh3-4b-ClipProj-v3.1.safetensors" and "mmh3-8b-ClipProj-v3.1.safetensors" only.
+  - Place the adapter safetensors in a subfolder called "ClipProj-MiniMax-H3" within your text_encoder_4b/text_encoder_8b directory. Use this subfolder path for the following args.
+  - `--use-text-encoder S` Text encoder size: 32b (default), 8b, or 4b
+  - `--use-text-encoder-adapter PATH` Path of text encoder adapter directory
 
 * **Latent Upscaler**: Integrated latent upscaling capabilities (`h3_lup`) that bypass costly full VAE encode/decode cycles to accelerate high-resolution video frame generation.  
   *(Based on [LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler))*
+  
+  Usage:
+  - `--lup-enabled` Enable latent upscaler (LBH-123-AI's latent upscaler)
+  - `--lup-scale S` Latent upscaler scale (default: 2.0)
+  - `--lup-steps S` Latent upscaler hi-res steps (default: 4)
 
 ---
 
