@@ -537,18 +537,18 @@ int load_adapter(h3_gpu *gpu, text_enc_adapter* adapter, char *error, size_t err
     memset(adapter, 0, sizeof(*adapter));
 
     // Load adapter weights
-    adapter->mean_in         = h3_weight_load_f32(store, gpu, "mean_in", 1, (uint64_t[]){TE.hidden}, error, error_size);
-    adapter->std_in          = h3_weight_load_f32(store, gpu, "std_in", 1, (uint64_t[]){TE.hidden}, error, error_size);
-    adapter->weight          = h3_weight_load_f32(store, gpu, "W", 2, (uint64_t[]){H3_TEXT_HIDDEN_SIZE, TE.hidden}, error, error_size);
-    adapter->sink_out        = h3_weight_load_f32(store, gpu, "sink_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
+    adapter->mean_in         = h3_weight_load_f32_from_f16(store, gpu, "mean_in", 1, (uint64_t[]){TE.hidden}, error, error_size);
+    adapter->std_in          = h3_weight_load_f32_from_f16(store, gpu, "std_in", 1, (uint64_t[]){TE.hidden}, error, error_size);
+    adapter->weight          = h3_weight_load_f32_from_f16(store, gpu, "W", 2, (uint64_t[]){H3_TEXT_HIDDEN_SIZE, TE.hidden}, error, error_size);
+    adapter->sink_out        = h3_weight_load_f32_from_f16(store, gpu, "sink_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
     /*
-    adapter->mlp_up_weight   = h3_weight_load_f32(store, gpu, "mlp.0.weight", 2, (uint64_t[]){TE_ADAPTER_INTERMEDIATE, TE.hidden}, error, error_size);
-    adapter->mlp_up_bias     = h3_weight_load_f32(store, gpu, "mlp.0.bias", 1, (uint64_t[]){TE_ADAPTER_INTERMEDIATE}, error, error_size);
-    adapter->mlp_down_weight = h3_weight_load_f32(store, gpu, "mlp.2.weight", 2, (uint64_t[]){H3_TEXT_HIDDEN_SIZE, TE_ADAPTER_INTERMEDIATE}, error, error_size);
-    adapter->mlp_down_bias   = h3_weight_load_f32(store, gpu, "mlp.2.bias", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
+    adapter->mlp_up_weight   = h3_weight_load_f32_from_f16(store, gpu, "mlp.0.weight", 2, (uint64_t[]){TE_ADAPTER_INTERMEDIATE, TE.hidden}, error, error_size);
+    adapter->mlp_up_bias     = h3_weight_load_f32_from_f16(store, gpu, "mlp.0.bias", 1, (uint64_t[]){TE_ADAPTER_INTERMEDIATE}, error, error_size);
+    adapter->mlp_down_weight = h3_weight_load_f32_from_f16(store, gpu, "mlp.2.weight", 2, (uint64_t[]){H3_TEXT_HIDDEN_SIZE, TE_ADAPTER_INTERMEDIATE}, error, error_size);
+    adapter->mlp_down_bias   = h3_weight_load_f32_from_f16(store, gpu, "mlp.2.bias", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
     */
-    adapter->std_out         = h3_weight_load_f32(store, gpu, "std_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
-    adapter->mean_out        = h3_weight_load_f32(store, gpu, "mean_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
+    adapter->std_out         = h3_weight_load_f32_from_f16(store, gpu, "std_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
+    adapter->mean_out        = h3_weight_load_f32_from_f16(store, gpu, "mean_out", 1, (uint64_t[]){H3_TEXT_HIDDEN_SIZE}, error, error_size);
 
     // Free weights store
     h3_weight_store_free(store);

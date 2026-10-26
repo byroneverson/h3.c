@@ -1,4 +1,5 @@
 #include "h3_weights.h"
+#include "h3_gpu.h"
 
 #include <dirent.h>
 #include <stdarg.h>
@@ -199,6 +200,25 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
                                   char *error, size_t error_size) {
     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_F32,
                        error, error_size);
+}
+
+h3_gpu_tensor *h3_weight_load_f32_from_f16(const h3_weight_store *store, h3_gpu *gpu,
+                                   const char *name, int ndim,
+                                   const uint64_t *shape,
+                                   char *error, size_t error_size) {
+    h3_gpu_tensor *tensor = load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_F16, error, error_size);
+    if (!tensor) return NULL;
+    size_t elements = h3_gpu_tensor_elements(tensor);
+    h3_gpu_tensor *tensor_f32 = h3_gpu_tensor_new(gpu, elements, H3_GPU_F32);
+    h3_gpu_begin(gpu);
+    if (!h3_gpu_cast(gpu, tensor_f32, tensor, (uint32_t)elements)) {
+        h3_gpu_tensor_free(tensor);
+        h3_gpu_tensor_free(tensor_f32);
+        return NULL;
+    }
+    h3_gpu_tensor_free(tensor);
+    h3_gpu_submit(gpu);
+    return tensor_f32;
 }
 
 h3_gpu_tensor *h3_weight_load_f16_from_bf16(const h3_weight_store *store, h3_gpu *gpu,
